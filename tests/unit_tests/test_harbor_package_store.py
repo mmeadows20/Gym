@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import nemo_gym.tasks.harbor.manifest as manifest_module
 from nemo_gym.tasks.harbor import content_hash, discover_tasks
 from tests.unit_tests.test_harbor_tasks import (
     no_real_registry,  # noqa: F401 (autouse fixture)
@@ -95,17 +96,19 @@ class TestPackageStore:
         assert sorted(p.name for p in folder.iterdir() if p.is_dir()) == ["alpha", "beta"]
         assert content_hash(folder / "alpha") == digests["alpha"]
         manifest = tomllib.loads((folder / "manifest.toml").read_text())
-        assert manifest["dataset"] == {
-            "name": "terminal-bench/terminal-bench",
-            "version": "4.0.0",
-            "source": "harbor-package-store",
-            "content_hash": "sha256:" + "d" * 64,
-        }
+        # Derived facts only: no copy of the name or version, which live in dataset.toml.
+        assert manifest["schema_version"] == 1
+        assert set(manifest["dataset"]) == {"source", "digest", "dataset_toml_digest", "downstream_digest"}
+        assert manifest["dataset"]["source"] == "harbor-package-store"
+        assert manifest["dataset"]["digest"] == manifest_module.dataset_digest(
+            digests, manifest["dataset"]["dataset_toml_digest"], manifest["dataset"]["downstream_digest"]
+        )
         assert manifest["tasks"]["beta"] == {
+            "digest": digests["beta"],
             "package": "terminal-bench/beta",
             "content_hash": f"sha256:{digests['beta']}",
-            "digest": f"sha256:{digests['beta']}",
         }
+        assert "name" not in (folder / "manifest.toml").read_text()
         # A second fetch downloads nothing: every folder's digest already matches.
         downloads_before = sum(1 for c in calls if c[1].startswith("/storage/"))
         module.fetch_package_dataset(
@@ -536,7 +539,7 @@ class TestPackageStore:
         assert manifest["tasks"]["alpha"] == {
             "package": "terminal-bench/alpha",
             "content_hash": f"sha256:{digests['alpha']}",
-            "digest": f"sha256:{content_hash(source)}",
+            "digest": content_hash(source),
         }
         manifest_text = (folder / "manifest.toml").read_text()
 
@@ -590,81 +593,67 @@ class TestPackageStore:
         (folder / "alpha" / "instruction.md").write_text("edited locally\n")
         edited = content_hash(folder / "alpha")
         head = (folder / "manifest.toml").read_text().split("[tasks.")[0]
-        # A hand-edited entry that pins another task version, or no table at all, does not make the edited folder
-        # pass: the folder is compared with the store's hash, as a folder without a record is.
-        for tasks in (
-            f'[tasks."alpha"]\npackage = "terminal-bench/alpha"\ncontent_hash = "sha256:{"f" * 64}"\n'
-            f'digest = "sha256:{edited}"\n',
-            'tasks = "not a table"\n',
-            f'[tasks."alpha"]\npackage = "terminal-bench/alpha"\ncontent_hash = "sha256:{digests["alpha"]}"\n',
+        # A hand-edited entry that pins another task version, or no entry for the task at all, does not make the
+        # edited folder pass: the manifest was written for another version of the dataset, and the fetch stops there.
+        for tasks, difference in (
+            (
+                f'[tasks."alpha"]\npackage = "terminal-bench/alpha"\ncontent_hash = "sha256:{"f" * 64}"\n'
+                f'digest = "{edited}"\n',
+                "changed 1",
+            ),
+            ("", "added 1"),
         ):
             (folder / "manifest.toml").write_text(head + tasks)
-            with pytest.raises(
-                module.PackageStoreError, match=f"the store's terminal-bench/alpha .* is sha256:{digests['alpha']}"
-            ):
+            with pytest.raises(module.PackageStoreError, match=rf"another version .*\(tasks {difference}\)"):
                 module.fetch_package_dataset(ref, tmp_path / "datasets")
+        # An entry with the right pin but no digest vouches for nothing: the folder is compared with the store's
+        # hash, as a folder without a record is.
+        (folder / "manifest.toml").write_text(
+            head + f'[tasks."alpha"]\npackage = "terminal-bench/alpha"\ncontent_hash = "sha256:{digests["alpha"]}"\n'
+        )
+        with pytest.raises(
+            module.PackageStoreError, match=f"the store's terminal-bench/alpha .* is sha256:{digests['alpha']}"
+        ):
+            module.fetch_package_dataset(ref, tmp_path / "datasets")
         assert sum(1 for c in calls if c[1].startswith("/storage/")) == 1
 
-    def test_folder_fetched_for_another_package_is_refused_by_name(self, tmp_path, monkeypatch):
+    def test_folder_fetched_for_another_package_is_refused_by_its_task_pins(self, tmp_path, monkeypatch):
+        """The manifest holds no copy of the dataset's name, so the per-task `package` pins (`<org>/<task>`) are
+        what tell another org's dataset of the same name and tag, which lands in the same readable folder."""
         folders = {"alpha": write_task(tmp_path / "src" / "alpha")}
         module, _, calls = self.fake_store(tmp_path, monkeypatch, folders)
         folder = module.fetch_package_dataset(
             module.PackageRef("terminal-bench", "terminal-bench", "4.0.0"), tmp_path / "datasets"
         )
         manifest_before = (folder / "manifest.toml").read_text()
+        assert "terminal-bench/terminal-bench" not in manifest_before  # no dataset name to compare by
         downloads_before = sum(1 for c in calls if c[1].startswith("/storage/"))
-        # Another org's dataset with the same name and tag would land in the same readable folder.
         with pytest.raises(module.PackageStoreError) as info:
             module.fetch_package_dataset(
                 module.PackageRef("someone-else", "terminal-bench", "4.0.0"), tmp_path / "datasets"
             )
         message = str(info.value)
-        assert message.startswith(f"{folder} was fetched for terminal-bench/terminal-bench@4.0.0 (sha256:{'d' * 64})")
-        assert f"not someone-else/terminal-bench@4.0.0 (sha256:{'d' * 64})" in message
+        assert message.startswith(f"{folder} was fetched for another package: its manifest pins terminal-bench/alpha")
+        assert "not the someone-else/<task> packages of someone-else/terminal-bench@4.0.0" in message
         assert "Move the folder aside (or delete it) and run again" in message
         assert (folder / "manifest.toml").read_text() == manifest_before
         assert content_hash(folder / "alpha") == content_hash(folders["alpha"])
         assert sum(1 for c in calls if c[1].startswith("/storage/")) == downloads_before
 
         # A folder another fetcher wrote (the registry path) is refused with its source named.
-        (folder / "manifest.toml").write_text(
-            '[dataset]\nname = "terminal-bench"\nversion = "2.0"\nsource = "harbor-registry"\n'
-        )
-        with pytest.raises(module.PackageStoreError, match=r"terminal-bench@2\.0 from harbor-registry, not "):
+        (folder / "manifest.toml").write_text('[dataset]\nsource = "harbor-registry"\n')
+        with pytest.raises(module.PackageStoreError, match="written by a harbor-registry fetch, not a package-store"):
             module.fetch_package_dataset(
                 module.PackageRef("terminal-bench", "terminal-bench", "4.0.0"), tmp_path / "datasets"
             )
-
-    def test_moved_latest_is_refused_as_stale_with_both_hashes(self, tmp_path, monkeypatch):
-        import dataclasses
-
-        folders = {"alpha": write_task(tmp_path / "src" / "alpha")}
-        module, digests, calls = self.fake_store(tmp_path, monkeypatch, folders, tag="latest")
-        ref = module.PackageRef("terminal-bench", "terminal-bench")
-        folder = module.fetch_package_dataset(ref, tmp_path / "datasets")
-        assert folder == tmp_path / "datasets" / "terminal-bench"
-        assert f'content_hash = "sha256:{"d" * 64}"' in (folder / "manifest.toml").read_text()
-        # `latest` moves on: the store resolves the plain reference to another version.
-        resolve = module.PackageStore.resolve_dataset
-        monkeypatch.setattr(
-            module.PackageStore,
-            "resolve_dataset",
-            lambda self, ref: dataclasses.replace(resolve(self, ref), content_hash="e" * 64),
+        # The same tasks under the same org, as the store publishes them, are this package: nothing is refused.
+        (folder / "manifest.toml").write_text(manifest_before)
+        assert (
+            module.fetch_package_dataset(
+                module.PackageRef("terminal-bench", "terminal-bench", "4.0.0"), tmp_path / "datasets"
+            )
+            == folder
         )
-        downloads_before = sum(1 for c in calls if c[1].startswith("/storage/"))
-        with pytest.raises(module.PackageStoreError) as info:
-            module.fetch_package_dataset(ref, tmp_path / "datasets")
-        message = str(info.value)
-        assert message.startswith(f"{folder} is stale: it was fetched when terminal-bench/terminal-bench@latest")
-        assert f"resolved to sha256:{'d' * 64}" in message
-        assert f"terminal-bench/terminal-bench@latest now resolves to sha256:{'e' * 64}" in message
-        assert "run again to fetch the current version" in message
-        assert sum(1 for c in calls if c[1].startswith("/storage/")) == downloads_before
-        assert content_hash(folder / "alpha") == digests["alpha"]
-        # Moving the folder aside, as the message says, fetches the current version in its place.
-        folder.rename(tmp_path / "terminal-bench-old")
-        assert module.fetch_package_dataset(ref, tmp_path / "datasets") == folder
-        assert f'content_hash = "sha256:{"e" * 64}"' in (folder / "manifest.toml").read_text()
 
     def test_unreadable_manifest_is_rewritten_after_the_task_checks(self, tmp_path, monkeypatch, caplog):
         folders = {"alpha": write_task(tmp_path / "src" / "alpha")}
@@ -678,3 +667,31 @@ class TestPackageStore:
                 assert module.fetch_package_dataset(ref, tmp_path / "datasets") == folder
             assert (folder / "manifest.toml").read_text() == good
         assert "is unreadable and will be rewritten" in caplog.text
+
+    def test_newer_schema_manifest_stops_the_fetch_untouched(self, tmp_path, monkeypatch):
+        """A manifest a newer Gym wrote is not "unreadable": it says more than this Gym reads, so the fetch must
+        not replace it with a schema-1 one that drops what it carried, and downloads nothing."""
+        folders = {"alpha": write_task(tmp_path / "src" / "alpha")}
+        module, digests, calls = self.fake_store(tmp_path, monkeypatch, folders)
+        ref = module.PackageRef("terminal-bench", "terminal-bench", "4.0.0")
+        folder = module.fetch_package_dataset(ref, tmp_path / "datasets")
+        good = (folder / "manifest.toml").read_text()
+        assert good.startswith("schema_version = 1\n")
+        downloads_before = sum(1 for c in calls if c[1].startswith("/storage/"))
+        for version in ("2", "1.0"):
+            newer = good.replace("schema_version = 1\n", f"schema_version = {version}\n", 1)
+            newer += '\n[future]\nkey = "x"\n'
+            (folder / "manifest.toml").write_text(newer)
+            with pytest.raises(
+                manifest_module.UnsupportedManifestError, match=f"schema_version {version}; this Gym reads 1"
+            ) as info:
+                module.fetch_package_dataset(ref, tmp_path / "datasets")
+            assert isinstance(info.value, manifest_module.ManifestError)
+            assert (folder / "manifest.toml").read_text() == newer
+            assert content_hash(folder / "alpha") == digests["alpha"]
+            assert sum(1 for c in calls if c[1].startswith("/storage/")) == downloads_before
+        # Restored, the same folder fetches again with nothing downloaded: the manifest was intact all along.
+        (folder / "manifest.toml").write_text(good)
+        assert module.fetch_package_dataset(ref, tmp_path / "datasets") == folder
+        assert (folder / "manifest.toml").read_text() == good
+        assert sum(1 for c in calls if c[1].startswith("/storage/")) == downloads_before

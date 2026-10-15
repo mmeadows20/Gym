@@ -7,11 +7,10 @@ Harbor publishes some datasets (Terminal Bench 4 among them) as packages rather 
 git checkouts. A dataset version is a list of task packages, each pinned by the
 content hash Gym also uses as its task digest. Fetching a dataset resolves the version,
 downloads every task archive, checks each against Harbor's published hash and writes
-``manifest.toml``, whose ``[dataset]`` table pins the package (``org/name``), the reference
-and the content hash the fetch resolved, and whose ``[tasks]`` entries record Gym's digest of
-each task folder as fetched. A later fetch into the same folder reads that pin back, refuses
-a folder that holds another package or an earlier resolution of this one, and compares each
-task folder with the digest recorded for it.
+``manifest.toml`` with the per-task digests and package pins (see :mod:`nemo_gym.tasks.harbor.manifest`):
+per task the store's hash and Gym's digest of the folder as fetched. A later fetch into the same folder
+compares each task folder with the digest recorded for it, and refuses a folder whose manifest was
+written for another version of the dataset.
 
 The store is Harbor's public PostgREST and storage API. Only the public
 (publishable) key is needed to read published packages.
@@ -24,7 +23,6 @@ import os
 import re
 import tarfile
 import tempfile
-import tomllib
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -33,7 +31,8 @@ from pathlib import Path
 from typing import Any
 
 from nemo_gym.tasks.harbor.digest import archive_hash, content_hash
-from nemo_gym.tasks.harbor.hub import contained_path, validate_task_name
+from nemo_gym.tasks.harbor.hub import contained_path, refuse_unrecorded_folders, validate_task_name
+from nemo_gym.tasks.harbor.manifest import MANIFEST_FILE, Manifest, ManifestError, UnsupportedManifestError
 
 
 logger = logging.getLogger(__name__)
@@ -41,7 +40,7 @@ logger = logging.getLogger(__name__)
 PACKAGE_STORE_URL = "https://ofhuhcpkvzjlejydnvyd.supabase.co"
 # Harbor's public read-only key, the same one its CLI ships with.
 PACKAGE_STORE_PUBLIC_KEY = "sb_publishable_Z-vuQbpvpG-PStjbh4yE0Q_e-d3MTIH"  # pragma: allowlist secret
-MANIFEST_FILE = "manifest.toml"
+PACKAGE_STORE_SOURCE = "harbor-package-store"
 _PAGE_SIZE = 1000
 _DIGEST = re.compile(r"(sha256:)?([a-f0-9]{64})")
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -72,7 +71,7 @@ class PackageRef:
         """``<name>`` for ``latest``, ``<name>-<tag>`` for a tag, ``<name>-<12 digest chars>`` for a digest pin.
 
         ``latest`` is what a plain ``harbor:org/name`` reference means, so its folder carries the plain
-        name and ``manifest.toml`` records the content hash it resolved to. A pinned tag or digest keeps
+        name and ``manifest.toml`` records the task packages it resolved to. A pinned tag or digest keeps
         its suffix, so two pins of one dataset never share a folder.
         """
         if self.ref == "latest":
@@ -291,102 +290,88 @@ class PackageStore:
                 raise
 
 
-def _read_manifest(folder: Path) -> dict[str, Any]:
-    """The manifest a previous fetch wrote to ``folder``, parsed, or ``{}`` when there is none or it is unreadable."""
-    manifest = folder / MANIFEST_FILE
-    if not manifest.is_file():
-        return {}
-    try:
-        return tomllib.loads(manifest.read_text())
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        logger.warning("%s is unreadable and will be rewritten: %s", manifest, exc)
-        return {}
-
-
-def _recorded_dataset(manifest: dict[str, Any]) -> dict[str, str]:
-    """The ``[dataset]`` table of a parsed manifest (string fields only), or ``{}``."""
-    recorded = manifest.get("dataset", {})
-    if not isinstance(recorded, dict):
-        return {}
-    return {key: value for key, value in recorded.items() if isinstance(value, str)}
-
-
-def _recorded_digests(manifest: dict[str, Any], dataset: ResolvedDataset) -> dict[str, str]:
+def _recorded_digests(previous: Manifest | None, dataset: ResolvedDataset) -> dict[str, str]:
     """Gym's digest of each task folder as the previous fetch wrote it, by task name.
 
     Only an entry that pins the task version ``dataset`` names counts, so a hand-edited or foreign
     manifest never vouches for a folder.
     """
-    tasks = manifest.get("tasks", {})
-    if not isinstance(tasks, dict):
+    if previous is None:
         return {}
     digests: dict[str, str] = {}
     for task in dataset.tasks:
-        entry = tasks.get(task.name)
-        if not isinstance(entry, dict) or entry.get("content_hash") != f"sha256:{task.content_hash}":
-            continue
-        digest = entry.get("digest")
-        if isinstance(digest, str) and digest.startswith("sha256:"):
-            digests[task.name] = digest.removeprefix("sha256:")
+        entry = previous.tasks.get(task.name, {})
+        if entry.get("content_hash") == f"sha256:{task.content_hash}" and entry.get("digest"):
+            digests[task.name] = entry["digest"]
     return digests
 
 
-def _check_recorded_identity(folder: Path, dataset: ResolvedDataset, recorded: dict[str, str]) -> None:
-    """Refuse ``folder`` when ``recorded``, its manifest's ``[dataset]`` table, pins another dataset than ``dataset``.
+def _write_manifest(folder: Path, dataset: ResolvedDataset, digests: dict[str, str]) -> None:
+    """Derived facts only: per-task digests and package pins; name and version stay in ``dataset.toml``.
 
-    Folder names stay readable (``<name>``, ``<name>-<tag>``), so the manifest's ``[dataset]`` table is
-    what tells ``alice/evals@1.0`` from ``bob/evals@1.0`` in the same ``evals-1.0`` folder, and a
-    ``latest`` fetch from the version the tag has since moved to. Either mismatch names the recorded
-    identity and the requested one; the remedy is the same as for an edited task folder.
+    Only the store's tasks are recorded (``names``), with the digests the fetch already verified, so no
+    folder is hashed or scanned again and a folder the store does not name stays unrecorded.
     """
-    if not recorded:
+    Manifest.build(
+        folder,
+        source=PACKAGE_STORE_SOURCE,
+        pins={
+            task.name: {"package": task.package, "content_hash": f"sha256:{task.content_hash}"}
+            for task in dataset.tasks
+        },
+        digests=digests,
+        names=[task.name for task in dataset.tasks],
+    ).write(folder)
+
+
+def _check_recorded_identity(folder: Path, previous: Manifest | None, dataset: ResolvedDataset) -> None:
+    """Refuse ``folder`` when its manifest was written for another package than ``dataset``.
+
+    The manifest holds no copy of the dataset's name (that lives in ``dataset.toml``), but every task it
+    pins carries its package, ``<org>/<task>``, and a dataset's tasks all share its org. Folder names stay
+    readable (``<name>``, ``<name>-<tag>``), so those pins are what tell ``alice/evals@1.0`` from
+    ``bob/evals@1.0`` in the same ``evals-1.0`` folder; a manifest another fetcher wrote (the registry path)
+    is refused by its source. The remedy is the same as for an edited task folder.
+    """
+    if previous is None:
         return
     ref = dataset.ref
-    recorded_name = recorded.get("name", "?")
-    recorded_version = recorded.get("version", "?")
-    recorded_hash = recorded.get("content_hash", "").removeprefix("sha256:")
-    source = recorded.get("source")
-    requested = f"{ref.package}@{ref.ref} (sha256:{dataset.content_hash})"
-    if source != "harbor-package-store" or recorded_name != ref.package:
-        found = f"{recorded_name}@{recorded_version}"
-        if recorded_hash:
-            found += f" (sha256:{recorded_hash})"
-        if source != "harbor-package-store":
-            found += f" from {source or 'an unknown source'}"
+    requested = f"{ref.package}@{ref.ref}"
+    if previous.source and previous.source != PACKAGE_STORE_SOURCE:
         raise PackageStoreError(
-            f"{folder} was fetched for {found}, not {requested}. Move the folder aside (or delete it) and run again"
+            f"{folder} was written by a {previous.source} fetch, not a package-store fetch of {requested}. "
+            "Move the folder aside (or delete it) and run again"
         )
-    if recorded_hash != dataset.content_hash:
+    foreign = sorted(
+        pin["package"]
+        for pin in previous.pins.values()
+        if "package" in pin and pin["package"].rpartition("/")[0] != ref.org
+    )
+    if foreign:
+        others = f" and {len(foreign) - 1} more" if len(foreign) > 1 else ""
         raise PackageStoreError(
-            f"{folder} is stale: it was fetched when {ref.package}@{recorded_version} resolved to "
-            f"sha256:{recorded_hash}, and {ref.package}@{ref.ref} now resolves to sha256:{dataset.content_hash}. "
-            "Move the folder aside (or delete it) and run again to fetch the current version"
+            f"{folder} was fetched for another package: its manifest pins {foreign[0]}{others}, not the "
+            f"{ref.org}/<task> packages of {requested}. Move the folder aside (or delete it) and run again"
         )
 
 
-def _write_manifest(folder: Path, dataset: ResolvedDataset, digests: dict[str, str]) -> None:
-    """Write the manifest: the dataset pin, then per task the store's hash and Gym's digest of the fetched folder."""
-
-    def quote(value: str) -> str:
-        return json.dumps(value)
-
-    lines = [
-        "[dataset]",
-        f"name = {quote(dataset.ref.package)}",
-        f"version = {quote(dataset.ref.ref)}",
-        'source = "harbor-package-store"',
-        f"content_hash = {quote('sha256:' + dataset.content_hash)}",
-        "",
-    ]
-    for task in sorted(dataset.tasks, key=lambda t: t.name):
-        lines += [
-            f"[tasks.{quote(task.name)}]",
-            f"package = {quote(task.package)}",
-            f"content_hash = {quote('sha256:' + task.content_hash)}",
-            f"digest = {quote('sha256:' + digests[task.name])}",
-            "",
-        ]
-    (folder / MANIFEST_FILE).write_text("\n".join(lines))
+def _stale_reason(previous: Manifest | None, dataset: ResolvedDataset) -> str | None:
+    """How the store's version differs from the one the manifest was written for, or ``None``."""
+    if previous is None or not previous.records_content:
+        return None
+    # Only a task the store pinned counts as recorded; an entry without a pin is not a removed task.
+    recorded = {name: pin["content_hash"] for name, pin in previous.pins.items() if "content_hash" in pin}
+    resolved = {task.name: f"sha256:{task.content_hash}" for task in dataset.tasks}
+    added = sorted(set(resolved) - set(recorded))
+    removed = sorted(set(recorded) - set(resolved))
+    changed = sorted(name for name in set(recorded) & set(resolved) if recorded[name] != resolved[name])
+    if not (added or removed or changed):
+        return None
+    return ", ".join(
+        f"{label} {len(names)}"
+        for label, names in (("added", added), ("removed", removed), ("changed", changed))
+        if names
+    )
 
 
 def fetch_package_dataset(ref: PackageRef, root: Path, store: PackageStore | None = None) -> Path:
@@ -399,12 +384,15 @@ def fetch_package_dataset(ref: PackageRef, root: Path, store: PackageStore | Non
     (the fetch was interrupted) with the store's hash by either digest. A task folder whose
     digest differs (it was edited locally, or the store republished it) stops the fetch with
     both digests named, so edits are never discarded silently; deleting or moving the folder
-    aside and running again fetches the store's copy. Anything else in a task's place (a
-    folder without ``task.toml``, a file, a symlink) also stops the fetch: only what this
-    function fetched is ever replaced.
-    A dataset folder whose ``manifest.toml`` pins another package, or an earlier resolution
-    of this one (``latest`` has moved), stops the fetch before any task is looked at, with
-    the recorded and the requested identity named. Returns the dataset folder.
+    aside and running again fetches the store's copy. A folder whose manifest was written for
+    another version of the dataset (``latest`` moved), or for another package (its task pins
+    name another org), is refused the same way, so one folder never mixes two versions or two
+    packages. A manifest a newer Gym wrote (a schema this Gym does not read) stops the fetch
+    with the folder untouched, since this Gym cannot tell what it recorded; a malformed one
+    (not TOML, or not the expected tables) vouches for nothing and is rewritten once the task
+    folders have passed the checks above. Anything else in a task's place (a folder without
+    ``task.toml``, a file, a symlink) also stops the fetch: only what this function fetched is
+    ever replaced. Returns the dataset folder.
     """
     store = store or PackageStore()
     dataset = store.resolve_dataset(ref)
@@ -420,9 +408,27 @@ def fetch_package_dataset(ref: PackageRef, root: Path, store: PackageStore | Non
     folder.mkdir(parents=True, exist_ok=True)
     if (folder / MANIFEST_FILE).is_symlink():
         raise PackageStoreError(f"Dataset manifest must not be a symlink: {folder / MANIFEST_FILE}")
-    manifest = _read_manifest(folder)
-    _check_recorded_identity(folder, dataset, _recorded_dataset(manifest))
-    recorded = _recorded_digests(manifest, dataset)
+    try:
+        previous = Manifest.read(folder)
+    except UnsupportedManifestError:
+        raise  # written by a newer Gym: the error says to upgrade or move the folder aside; nothing is rewritten
+    except ManifestError as exc:
+        logger.warning("%s is unreadable and will be rewritten: %s", folder / MANIFEST_FILE, exc)
+        previous = None
+    _check_recorded_identity(folder, previous, dataset)
+    stale = _stale_reason(previous, dataset)
+    if stale is not None:
+        raise PackageStoreError(
+            f"{folder / MANIFEST_FILE} was written for another version of {ref.package}: the store's {ref.ref} "
+            f"differs (tasks {stale}). Delete the folder, or move it aside, and run again to fetch "
+            f"{ref.package}@{ref.ref}, or pin the version you have with `harbor:{ref.package}@<tag>`"
+        )
+    # The manifest written below records the store's tasks; a folder it would not record must not be there.
+    pinned = {name for name, pin in (previous.pins if previous is not None else {}).items() if "content_hash" in pin}
+    refuse_unrecorded_folders(
+        folder, {task.name for task in dataset.tasks} | pinned, what="store", error=PackageStoreError
+    )
+    recorded = _recorded_digests(previous, dataset)
     digests: dict[str, str] = {}
     for task in dataset.tasks:
         target = folder / task.name
@@ -452,6 +458,8 @@ def fetch_package_dataset(ref: PackageRef, root: Path, store: PackageStore | Non
             )
         logger.info("Fetching %s (sha256:%s)", task.package, task.content_hash[:12])
         store.download_task(task, target)
+        # download_task checked the unpacked archive against the store's hash; the manifest records Gym's
+        # digest of the folder it left, which differs when the package ships a name that digest skips.
         digests[task.name] = content_hash(target)
     _write_manifest(folder, dataset, digests)
     return folder
