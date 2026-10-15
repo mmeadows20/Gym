@@ -31,6 +31,7 @@ from nemo_gym.config_types import ConfigError
 from nemo_gym.path_utils import materialized_path_for
 from nemo_gym.sandbox.compose_config import deployment_platform
 from nemo_gym.sandbox.compose_fields import DEFAULT_PLATFORM
+from nemo_gym.sandbox.config import SANDBOX_BLOCK_VOLUME_SOURCES_KEY, validate_volume_sources
 from nemo_gym.tasks.harbor.build_options import (
     BuildOptions,
     _block_from_overrides,
@@ -163,6 +164,40 @@ def compose_platform_from_overrides(overrides: list[str]) -> str:
     return deployment_platform({"platform": platform} if platform is not None else None)
 
 
+def volume_sources_from_overrides(overrides: list[str], sandbox: str | None) -> dict[str, str] | None:
+    """The ``volume_sources`` of the ``sandbox:`` block the command names, for checking Compose volumes at prepare.
+
+    The block comes from the ``--sandbox`` provider file (when given) and the configuration the command
+    line names, merged as :func:`_block_from_overrides` does. ``None`` when no ``volume_sources`` is
+    configured: prepare then reports every external volume and foreign bind mount as unmapped.
+    """
+    return _block_volume_sources(overrides, sandbox, SANDBOX_BLOCK_KEY)
+
+
+def gpu_volume_sources_from_overrides(overrides: list[str], sandbox: str | None) -> dict[str, str] | None:
+    """The ``volume_sources`` of the block GPU-declaring tasks run on, for checking their Compose volumes at prepare.
+
+    The block is the environment server's ``gpu_sandbox_provider`` in the configuration the command names
+    (``GPU_SANDBOX_PROVIDER_KEY``). ``None`` when no GPU block is set: every task is then checked against
+    the ``sandbox:`` block. An empty mapping when the block is set but carries no ``volume_sources``, which
+    is what the server resolves such a task against.
+    """
+    block = _block_from_overrides(overrides, GPU_SANDBOX_PROVIDER_KEY)
+    if block is None:
+        return None
+    if not isinstance(block, str) or not block:
+        raise ValueError(f"`{GPU_SANDBOX_PROVIDER_KEY}` must name a top-level sandbox block; got {block!r}")
+    return _block_volume_sources(overrides, sandbox, block) or {}
+
+
+def _block_volume_sources(overrides: list[str], sandbox: str | None, block: str) -> dict[str, str] | None:
+    files = [resolve_sandbox_config(sandbox)] if sandbox is not None else []
+    sources = _block_from_overrides(overrides, f"{block}.{SANDBOX_BLOCK_VOLUME_SOURCES_KEY}", config_files=files)
+    if sources is None:
+        return None
+    return validate_volume_sources(sources, f"the `{block}:` block")
+
+
 @dataclass(frozen=True)
 class PreparedTaskset:
     taskset: str
@@ -202,6 +237,8 @@ def prepare_target(
     sandbox_provider: str | None = None,
     gpu_sandbox_provider: str | None = None,
     compose_platform: str = DEFAULT_PLATFORM,
+    volume_sources: dict[str, str] | None = None,
+    gpu_volume_sources: dict[str, str] | None = None,
     rows_name: str = "tasks.jsonl",
 ) -> PreparedTaskset:
     """Fetch (for hub references) and load the tasks, then write the rows file.
@@ -218,9 +255,11 @@ def prepare_target(
     is named. Compose service fields are checked against ``sandbox_provider`` and ``gpu_sandbox_provider``,
     the provider names of the ``sandbox:`` and GPU blocks, which decide the ``tmpfs``, ``ulimits``, ``sysctls``
     and ``security_opt`` each service's provider can apply, and against ``compose_platform``, the deployment's (see
-    ``nemo_gym.tasks.harbor.image_configs.check_task_compose_fields``). ``rows_name`` names the rows file inside the taskset's output folder: a run
-    scopes it to its agent, so two agents prepared with different selections on one taskset keep their own
-    rows.
+    ``nemo_gym.tasks.harbor.image_configs.check_task_compose_fields``). Compose ``volumes`` are checked against ``volume_sources``, the deployment's mapping of
+    external volumes and foreign bind sources to shared storage (see ``nemo_gym.sandbox.config``); a task that
+    declares GPUs is checked against ``gpu_volume_sources`` when given, the mapping of the block the server runs
+    such tasks on. ``rows_name`` names the rows file inside the taskset's output folder: a run scopes it to its
+    agent, so two agents prepared with different selections on one taskset keep their own rows.
     """
     build = build or BuildOptions()
     if is_hub_ref(target):
@@ -286,9 +325,9 @@ def prepare_target(
         print(f"Skipping {task_id}: {reason}")
     if not tasks:
         raise _no_runnable_task(folder, errors)
-    # A Compose file that does not resolve, or a field the sandbox Compose adapter would refuse at seed, leaves its
-    # task out the same way, with the field named, as an unloadable task is, not as a seed failure of every episode;
-    # the others' images are still recorded.
+    # A Compose file that does not resolve, a field the sandbox Compose adapter would refuse at seed, or volumes the
+    # group cannot run, leaves its task out the same way, with the field named, as an unloadable task is, not as a
+    # seed failure of every episode; the others' images are still recorded.
     unresolved: dict[str, str] = {}
     images = record_compose_images(
         tasks,
@@ -298,6 +337,8 @@ def prepare_target(
         sandbox_provider=sandbox_provider,
         gpu_sandbox_provider=gpu_sandbox_provider,
         compose_platform=compose_platform,
+        volume_sources=volume_sources,
+        gpu_volume_sources=gpu_volume_sources,
     )
     if unresolved:
         for task_id, reason in unresolved.items():
@@ -572,6 +613,8 @@ def run_target(args: argparse.Namespace, overrides: list[str]) -> None:
             sandbox_provider=sandbox_provider_from_overrides(overrides, sandbox),
             gpu_sandbox_provider=gpu_sandbox_provider_from_overrides(overrides, sandbox),
             compose_platform=compose_platform_from_overrides(overrides),
+            volume_sources=volume_sources_from_overrides(overrides, sandbox),
+            gpu_volume_sources=gpu_volume_sources_from_overrides(overrides, sandbox),
             rows_name=_rows_name(agent),
         )
     except (HarborTaskError, HubError, BuildError, ImageConfigError, ConfigError, ValueError, OSError) as exc:
@@ -691,6 +734,8 @@ def validate_target(args: argparse.Namespace, overrides: list[str], *, agent: Ag
             sandbox_provider=sandbox_provider_from_overrides(overrides, sandbox),
             gpu_sandbox_provider=gpu_sandbox_provider_from_overrides(overrides, sandbox),
             compose_platform=compose_platform_from_overrides(overrides),
+            volume_sources=volume_sources_from_overrides(overrides, sandbox),
+            gpu_volume_sources=gpu_volume_sources_from_overrides(overrides, sandbox),
             rows_name=_rows_name(agent),
         )
     except (

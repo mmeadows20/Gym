@@ -656,6 +656,49 @@ applies all four as `docker run` flags; OpenSandbox applies none (a pod exposes 
 security option through its API). When prepare cannot tell the provider, the adapter runs the same check against
 the live provider before creating any sandbox.
 
+## Compose volumes
+
+A service's `volumes` entries, short (`SOURCE:TARGET[:ro]`) or long syntax, are resolved at prepare and run
+in one of three ways, with the same planner at prepare and at seed:
+
+| Volume | How the sandbox group runs it |
+|---|---|
+| Bind mount of a task file or folder (`./seed.json:/app/seed.json`, `${CONTEXT_DIR}/data:/data`) | Uploaded into the service once it starts, before its command runs, so the process finds the file where the Compose file mounted it. The receiving folders are created when missing, and the target, every folder a file lands in (pre-existing or not: a `0700` folder the image ships at the target becomes readable, `0755`), the folders created for the upload and the uploaded files are made readable by every user (`chmod a+rX`, never recursive); what the image already holds under the target and the upload did not write keeps its mode; `ro` is not enforced. A folder's tree is recreated, empty folders included, over whatever the image already has under the target (a merge; a bind mount would hide the image's folder, so a task that relies on hiding, say an `/etc/nginx/conf.d` with a default site, behaves differently), and the names the task digest skips (`__pycache__`, `*.pyc`, `.DS_Store`, editor swap and backup files) are not uploaded, so what reaches the service is what the digest covers. A task file or folder bound into several services is uploaded into each service separately: the copies are independent, so a write in one service is not seen by the others, where a Docker bind mount would share one host folder. A source the task folder does not contain, a link leaving it, a link with an absolute target (the server plans on a copy of the task, where it would leave the folder), a folder that contains a link, or a source outside what the task digest covers (`environment/`, `tests/`, `solution/`, `steps/` and the top-level task files, free of editor-leftover names such as `__pycache__`; a `../data/seed.json` could change without changing the task's identity) fails prepare with the path. The target must be an absolute path below `/` with no `..`. |
+| Named volume declared under top-level `volumes:` (shared between services or not) | A folder on the provider's shared storage (`shared_storage` in the OpenSandbox block), mounted into every service that names it, copied up from the image's own content unless `nocopy`, removed when the group stops. |
+| `external: true` volume, or a bind mount of a host path outside the task | Resolved through `volume_sources` in the `sandbox:` block: a mapping of the volume name or host path to a path under the shared storage root. A volume with no entry fails prepare with its name. Only the entries a task's Compose file resolves this way reach the sandbox adapter, so an ordinary named volume that happens to share a mapped name stays the group's own, isolated per episode. |
+
+```yaml
+sandbox:
+  opensandbox:
+    shared_storage: { host_path: /mnt/shared }
+  volume_sources:
+    pgdata: datasets/pgdata        # volumes: { pgdata: { external: true } }
+    /var/lib/models: models        # - /var/lib/models:/models:ro
+```
+
+`gym eval run` and `gym dataset validate` read `volume_sources` from the `--sandbox` provider file and the
+configuration the command names; `prepare_target(..., volume_sources=...)` takes it directly. Without one,
+every external volume and foreign bind mount is reported at prepare. When the configuration sets the server's
+`gpu_sandbox_provider` (`harbor_environment_server.environment_servers.harbor.gpu_sandbox_provider`), a task
+that declares GPUs is checked against that block's `volume_sources` instead, the block the server seeds it
+from, and so is a sidecar that reserves GPUs through `deploy.resources` (the server routes it to the GPU
+block, and its external volumes are seeded and mounted through that block's mapping), so a mapping has to be
+present in each block whose services need it; `prepare_target(..., gpu_volume_sources=...)` takes that mapping
+directly. A bind of Harbor's `/logs` tree (`${HOST_VERIFIER_LOGS_PATH}:/logs/verifier`) onto `main` is not a
+mount: the sandbox adapter creates the path in the agent's sandbox before `main`'s command, hooks and
+healthcheck run, as Docker creates a bind target at container create, and a different target
+(`${HOST_ARTIFACTS_PATH}:/app/output`) becomes a link to it, since under Harbor both are one host folder. The
+link is made after the overlay's `RUN` lines and before the uploads, where Harbor's bind sits: a folder the
+image ships at the target (`RUN mkdir -p /app/output`) is replaced, with a warning in the server log when it
+was not empty, as the bind would hide it, and a task file bound under the target lands in `/logs/artifacts`.
+A target that nests its source, and a sidecar that binds the tree, fail prepare. Anonymous volumes, `tmpfs`, bind `propagation`, volume drivers and
+other unsupported options fail prepare naming the field.
+
+The `x-sandbox` key the planner writes for the sandbox adapter (`uploads`, and the sidecar adaptation's
+`hosts`/`resolve_environment`) is Gym's output, never task input: a Compose file that carries one fails
+prepare, and the server, naming `x-sandbox`. Upload sources are read in the server's process, so the adapter
+only accepts sources under the task copy it is handed.
+
 ## Where settings live
 
 Four homes, one owner each. A setting sits on this server's config only if every dataset on the same
@@ -665,7 +708,7 @@ deployment wants the same value; a unit test pins that list.
 |---|---|---|---|
 | Task | `task.toml` | task author | image, resources, timeouts, env, verifier, agent user (read-only once fetched) |
 | Dataset | `dataset.toml`, `[gym]` table | dataset author | `[gym.defaults]` `timeout_multiplier`, `resource_multiplier`; `[gym.tasks."<id>"]` `environment` and `verifier` overrides in Harbor's own fields (`env` merges, other fields replace) and `artifacts` additions appended to the task's own |
-| Deployment | the `sandbox:` provider block | operator | image rewrites and registry credentials (`images`), root setup commands (`setup`), networking, shared-memory labels |
+| Deployment | the `sandbox:` provider block | operator | image rewrites and registry credentials (`images`), root setup commands (`setup`), networking, shared-memory labels, shared storage and `volume_sources` for Compose volumes |
 | Run | run config | the run | provider selection, GPU routing, repeats, output paths, `sandbox_resources_override` for parity runs |
 
 `gym dataset init <name>` writes a dataset in this shape, and `gym dataset validate <folder>` with no extra
