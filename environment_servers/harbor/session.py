@@ -8,9 +8,9 @@ the working directory, the entrypoint launch and the stop flags, with the phased
 Harbor's collection order needs. Next to it live the workspace layout constants for the log
 and artifact folders, the task context file the agent harness reads, and the host template
 resolver for whole-value ${VAR} entries in task environments. The mixin holds the server
-methods that prepare the working directory, write the task context and describe sandbox
-access to the agent. The module sits below the verifier so that verifier code can be typed on
-HarborSession without importing the server.
+methods that prepare the working directory, write the task context, place the reference
+solution for the oracle and describe sandbox access to the agent. The module sits below the
+verifier so that verifier code can be typed on HarborSession without importing the server.
 """
 
 import json
@@ -18,7 +18,8 @@ import logging
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from fastapi import HTTPException
 
@@ -29,6 +30,7 @@ from nemo_gym.sandbox import AsyncSandbox, AsyncSandboxCompose
 from nemo_gym.sandbox.access import DirectSandboxConnection, SandboxAccess
 from nemo_gym.sandbox.transfer import exec_as_root, upload_dir
 from nemo_gym.tasks.harbor import HarborTask
+from nemo_gym.tasks.harbor.cli import ORACLE_AGENT
 
 
 LOGGER = logging.getLogger(__name__)
@@ -36,6 +38,9 @@ LOGGER = logging.getLogger(__name__)
 VERIFIER_LOGS_DIR = "/logs/verifier"
 AGENT_LOGS_DIR = "/logs/agent"
 ARTIFACTS_DIR = "/logs/artifacts"
+# Where the oracle finds the task's reference solution: Harbor's oracle copies ``solution/`` here
+# (0.22.0 ``agents/oracle.py``, ``EnvironmentPaths.solution_dir``) and runs ``solve.sh`` from it.
+SOLUTION_DIR = "/solution"
 
 TASK_CONTEXT_DIR = "/tmp/.nemo-gym"
 TASK_CONTEXT_FILE = f"{TASK_CONTEXT_DIR}/task.json"
@@ -60,6 +65,9 @@ class HarborSession:
     agent_sandbox_stopped: bool = False
     # In a Compose group the agent's own container is stopped before the sidecars' hooks run (see ``stop_main``).
     main_stopped: bool = False
+    # Environment the harness runs its commands with, handed over in its sandbox access: the host-resolved
+    # ``[solution].env`` when the harness is the oracle, nothing otherwise.
+    agent_env: dict[str, str] = field(default_factory=dict)
 
     def service(self, name: str | None) -> AsyncSandbox:
         """The sandbox of a Compose service; ``None`` or ``"main"`` is the agent's own."""
@@ -100,13 +108,19 @@ class HarborSession:
 _ENV_TEMPLATE = re.compile(r"\$\{([^}:]+)(?::-(.*))?\}")
 
 
-def resolve_env_templates(env: dict[str, str]) -> dict[str, str]:
-    """Resolve Harbor's whole-value host templates without changing the stored task."""
+def resolve_env_templates(env: dict[str, str], secrets: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Resolve Harbor's whole-value host templates without changing the stored task.
+
+    ``secrets`` (the server's operator secrets) are consulted before the process environment; they are
+    passed only when resolving the verifier process's environment.
+    """
     resolved: dict[str, str] = {}
     for key, value in env.items():
         match = _ENV_TEMPLATE.fullmatch(value)
         if match is None:
             resolved[key] = value
+        elif secrets and match.group(1) in secrets:
+            resolved[key] = secrets[match.group(1)]
         elif match.group(1) in os.environ:
             resolved[key] = os.environ[match.group(1)]
         elif match.group(2) is not None:
@@ -137,9 +151,9 @@ class HarborSessionMixin:
     Harbor's collection order needs. Next to it live the workspace layout constants for the log
     and artifact folders, the task context file the agent harness reads, and the host template
     resolver for whole-value ${VAR} entries in task environments. The mixin holds the server
-    methods that prepare the working directory, write the task context and describe sandbox
-    access to the agent. The module sits below the verifier so that verifier code can be typed on
-    HarborSession without importing the server.
+    methods that prepare the working directory, write the task context, place the reference
+    solution for the oracle and describe sandbox access to the agent. The module sits below the
+    verifier so that verifier code can be typed on HarborSession without importing the server.
 
     """
 
@@ -210,6 +224,36 @@ class HarborSessionMixin:
         if result.return_code:
             raise RuntimeError(f"Could not write {TASK_CONTEXT_FILE}: {result.stderr or result.stdout}")
 
+    def _agent_implementation(self) -> str | None:
+        """The implementation behind the configured agent instance: the one key under its ``responses_api_agents``.
+
+        ``None`` when the merged config does not show the instance in that shape (a test client, a block
+        with several implementations); the lookup for token capture reads the same block positionally.
+        """
+        ref = self.config.agent_server
+        instance = self.server_client.global_config_dict.get(ref.name)
+        implementations = instance.get(ref.type) if isinstance(instance, Mapping) else None
+        if not isinstance(implementations, Mapping) or len(implementations) != 1:
+            return None
+        return str(next(iter(implementations)))
+
+    async def _seed_solution(self, session: HarborSession) -> None:
+        """Place the task's reference solution for the oracle, as Harbor's oracle copies it into the environment.
+
+        Only an agent instance implemented by ``harbor_oracle_agent`` gets it: the seeded sandbox receives the
+        snapshot's ``solution/`` at ``/solution`` as root, readable by the task user, and the session carries
+        the host-resolved ``[solution].env`` for the harness's commands (Harbor 0.22.0 ``agents/oracle.py``
+        uploads the folder and resolves ``solution.env`` the same way). Any other harness never sees the
+        solution. A task without ``solution/`` uploads nothing; the oracle then reports it unvalidated.
+        """
+        if self._agent_implementation() != ORACLE_AGENT:
+            return
+        task = session.task
+        session.agent_env = resolve_env_templates(task.config.solution.env)
+        solution = task.path / "solution"
+        if solution.is_dir():
+            await upload_dir(session.sandbox, solution, SOLUTION_DIR, make_readable=True)
+
     async def _sandbox_access(self, session: HarborSession) -> SandboxAccess:
         return SandboxAccess(
             connection=DirectSandboxConnection(
@@ -217,4 +261,6 @@ class HarborSessionMixin:
                 descriptor=await session.sandbox.serialize(),
             ),
             workdir=session.workdir,
+            user=session.task.user,
+            env=session.agent_env,
         )

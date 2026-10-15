@@ -3,7 +3,6 @@
 
 import math
 from dataclasses import dataclass, field
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,48 +11,21 @@ from pytest import MonkeyPatch
 
 from nemo_gym.sandbox.providers.base import SandboxExecResult
 from nemo_gym.server_utils import ServerClient
-from nemo_gym.tasks.harbor import load_task
 from responses_api_agents.harbor_oracle_agent import app as module
 from responses_api_agents.harbor_oracle_agent.app import OracleAgent, OracleAgentConfig
 
 
-TASK_TOML = """
-schema_version = "1.4"
-
-[agent]
-timeout_sec = 120.0
-
-[solution.env]
-GREETING = "hi"
-
-[environment]
-cpus = 1
-"""
-
-
-def write_task(root: Path, *, solution: bool = True, toml: str = TASK_TOML) -> Path:
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "task.toml").write_text(toml)
-    (root / "instruction.md").write_text("Create hello.txt\n")
-    (root / "environment").mkdir(exist_ok=True)
-    (root / "environment" / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /app\nUSER runner")
-    (root / "tests").mkdir(exist_ok=True)
-    (root / "tests" / "test.sh").write_text("#!/bin/bash\n")
-    if solution:
-        (root / "solution").mkdir(exist_ok=True)
-        (root / "solution" / "solve.sh").write_text("#!/bin/bash\necho hi > hello.txt\n")
-    return root
-
-
 @dataclass
 class FakeSandbox:
-    """``result`` is what solve.sh produced: its stdout and stderr both land in the log the oracle tails.
+    """The sandbox the environment server seeded, with the solution already at ``/solution`` when ``solution`` is set.
 
+    ``result`` is what solve.sh produced: its stdout and stderr both land in the log the oracle tails.
     ``log_present=False`` models the guard exiting before the redirection created the log (no ``timeout``
     or ``bash`` in the image).
     """
 
     result: SandboxExecResult = SandboxExecResult(stdout="Done!\n", stderr="", return_code=0)
+    solution: bool = True
     log_present: bool = True
     execs: list[dict] = field(default_factory=list)
     uploads: list[str] = field(default_factory=list)
@@ -72,6 +44,8 @@ class FakeSandbox:
                 "preserve_background_services": preserve_background_services,
             }
         )
+        if command == "test -f /solution/solve.sh":
+            return SandboxExecResult(stdout="", stderr="", return_code=0 if self.solution else 1)
         if "solve.sh" in command:
             # solve.sh output is redirected to a file in the sandbox, so the exec itself carries only the
             # exit code and the provider's own error type.
@@ -92,27 +66,9 @@ class FakeSandbox:
         self.disconnected = True
 
 
-def make_agent(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-    *,
-    solution: bool = True,
-    sandbox: FakeSandbox | None = None,
-    toml: str = TASK_TOML,
-):
-    folder = tmp_path / "datasets" / "ds"
-    task = load_task(write_task(folder / "hello", solution=solution, toml=toml))
-    global_config = {
-        "sandbox": {"opensandbox": {"connection": {"domain": "example.invalid"}}},
-        "harbor_env": {
-            "environment_servers": {
-                "harbor": {
-                    "agent_server": {"type": "responses_api_agents", "name": "harbor_oracle_agent"},
-                    "tasksets": {"ds": {"folder": str(folder), "tasks": {"hello": task.digest}}},
-                }
-            }
-        },
-    }
+def make_agent(monkeypatch: MonkeyPatch, *, sandbox: FakeSandbox | None = None):
+    # The oracle needs the run config for one thing: the sandbox provider block its connection names.
+    global_config = {"sandbox": {"opensandbox": {"connection": {"domain": "example.invalid"}}}}
     monkeypatch.setattr(module, "get_global_config_dict", lambda: global_config)
     sandbox = sandbox or FakeSandbox()
     provider = MagicMock()
@@ -131,10 +87,20 @@ def make_agent(
         name="harbor_oracle_agent",
     )
     agent = OracleAgent(config=config, server_client=MagicMock(spec=ServerClient))
-    return agent, task, sandbox, connect
+    return agent, sandbox, connect
 
 
-def seed_body(*, session="ag-1", rollout="r1", with_sandbox=True):
+def seed_body(
+    *,
+    session="ag-1",
+    rollout="r1",
+    with_sandbox=True,
+    timeout: float | None = 120.0,
+    user: str | None = "runner",
+    env: dict[str, str] | None = None,
+):
+    """What the harbor environment server posts: the sandbox it seeded (the solution already in it), the task
+    user, the `[solution].env` it resolved on its host, and the task's `[agent].timeout_sec`."""
     body = {
         "agent_session_id": session,
         "episode_id": {"rollout_id": rollout, "attempt": 0},
@@ -145,15 +111,23 @@ def seed_body(*, session="ag-1", rollout="r1", with_sandbox=True):
         body["sandbox_access"] = {
             "connection": {"kind": "direct", "provider_config_ref": "sandbox", "descriptor": {"sandbox_id": "sb"}},
             "workdir": "/app",
+            "user": user,
+            "env": {"GREETING": "hi"} if env is None else env,
         }
+    if timeout is not None:
+        body["agent_timeout_sec"] = timeout
     return body
 
 
 RESPONSES_BODY = {"input": [{"role": "user", "content": "Create hello.txt"}]}
 
 
-def test_oracle_runs_solution_in_borrowed_sandbox(tmp_path, monkeypatch):
-    agent, task, sandbox, connect = make_agent(tmp_path, monkeypatch)
+def solve_run(sandbox: FakeSandbox) -> dict:
+    return next(call for call in sandbox.execs if "bash /solution/solve.sh" in call["command"])
+
+
+def test_oracle_runs_the_solution_the_server_placed_in_the_borrowed_sandbox(monkeypatch):
+    agent, sandbox, connect = make_agent(monkeypatch)
     client = TestClient(agent.setup_webserver())
 
     seed = client.post("/v1/agent_sessions", json=seed_body())
@@ -166,16 +140,22 @@ def test_oracle_runs_solution_in_borrowed_sandbox(tmp_path, monkeypatch):
     assert payload["metadata"]["oracle"] == "solved"
     assert payload["metadata"]["oracle_return_code"] == "0"
     assert payload["output"][0]["content"][0]["text"] == "Done!\n"
-    assert any(remote.endswith(".tar.gz") for remote in sandbox.uploads)
-    run = next(call for call in sandbox.execs if "solve.sh" in call["command"])
+    # The oracle uploads nothing: the environment server put /solution in place before the session opened.
+    assert sandbox.uploads == []
+    # It looks for the script as the task user, where Harbor's oracle copies the solution.
+    probe = sandbox.execs[0]
+    assert (probe["command"], probe["user"]) == ("test -f /solution/solve.sh", "runner")
+    run = solve_run(sandbox)
     # The portable short form (`--signal=` fails on BusyBox), guarded so a missing wrapper exits 127 before
     # the log is created; the log carries Harbor's oracle name.
     assert run["command"] == (
         f"{module.TIMEOUT_WRAPPER_GUARD}; timeout -s KILL 120 bash /solution/solve.sh > /logs/agent/oracle.txt 2>&1"
     )
     assert "--signal" not in run["command"]
+    # The budget is the seed's agent_timeout_sec; the exec outlives the in-container `timeout` by the grace.
     assert run["timeout_s"] == 120 + 60
     assert (run["cwd"], run["user"]) == ("/app", "runner")
+    # The `[solution].env` the server resolved travels in the sandbox access, under Harbor's oracle default.
     assert run["env"] == {"DEBIAN_FRONTEND": "noninteractive", "GREETING": "hi"}
     assert run["preserve_background_services"] is True
 
@@ -186,20 +166,19 @@ def test_oracle_runs_solution_in_borrowed_sandbox(tmp_path, monkeypatch):
     assert close.status_code == 200 and sandbox.disconnected
 
 
-MCP_TASK_TOML = (
-    TASK_TOML
-    + """
-[[environment.mcp_servers]]
-name = "playwright"
-transport = "sse"
-url = "http://api:3080/sse"
-"""
-)
+def test_oracle_reads_no_task_folder():
+    """The task, its digest and its solution are the environment server's; the oracle has no path to them."""
+    assert "environment_server" not in OracleAgentConfig.model_fields
+    assert set(OracleAgentConfig.model_fields) - set(module.BaseResponsesAPIAgentConfig.model_fields) == {
+        "max_solve_timeout_s",
+        "output_tail_chars",
+    }
+    assert not any(name in dir(module) for name in ("load_task", "HarborTask", "upload_dir", "Path"))
 
 
-def test_oracle_declares_task_tool_context_support_and_runs_the_solution_of_an_mcp_task(tmp_path, monkeypatch):
+def test_oracle_declares_task_tool_context_support(monkeypatch):
     """`gym dataset validate` must not refuse tasks with MCP servers or skills: solve.sh reaches them by itself."""
-    agent, _, sandbox, _ = make_agent(tmp_path, monkeypatch, toml=MCP_TASK_TOML)
+    agent, _, _ = make_agent(monkeypatch)
     client = TestClient(agent.setup_webserver())
 
     seed = client.post("/v1/agent_sessions", json=seed_body())
@@ -207,26 +186,42 @@ def test_oracle_declares_task_tool_context_support_and_runs_the_solution_of_an_m
     # The harbor environment server reads this declaration and lets the task through to the oracle.
     assert seed.json() == {"agent_session_id": "ag-1", "supports_task_tool_context": True}
 
-    response = client.post("/v1/responses", json=RESPONSES_BODY)
-    assert response.status_code == 200, response.text
-    assert response.json()["metadata"]["oracle"] == "solved"
-    assert any("solve.sh" in call["command"] for call in sandbox.execs)
 
-
-def test_task_without_solution_is_unvalidated_not_failed(tmp_path, monkeypatch):
-    agent, _, sandbox, _ = make_agent(tmp_path, monkeypatch, solution=False)
+def test_task_without_solution_is_unvalidated_not_failed(monkeypatch):
+    """The server uploaded nothing for a task without `solution/`, so the script is absent from the sandbox."""
+    sandbox = FakeSandbox(solution=False)
+    agent, _, _ = make_agent(monkeypatch, sandbox=sandbox)
     client = TestClient(agent.setup_webserver())
     assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
 
     payload = client.post("/v1/responses", json=RESPONSES_BODY).json()
 
     assert payload["metadata"] == {"oracle": "unvalidated"}
-    assert sandbox.execs == [] and sandbox.uploads == []
+    assert "solve.sh" in payload["output"][0]["content"][0]["text"]
+    # Only the probe ran: no log folder was prepared, nothing was executed or uploaded.
+    assert [call["command"] for call in sandbox.execs] == ["test -f /solution/solve.sh"]
+    assert sandbox.uploads == []
 
 
-def test_failing_solution_is_reported(tmp_path, monkeypatch):
+def test_sandbox_default_user_runs_the_solution_when_the_task_names_none(monkeypatch):
+    agent, sandbox, _ = make_agent(monkeypatch)
+    client = TestClient(agent.setup_webserver())
+    assert client.post("/v1/agent_sessions", json=seed_body(user=None)).status_code == 200
+    assert client.post("/v1/responses", json=RESPONSES_BODY).json()["metadata"]["oracle"] == "solved"
+    assert sandbox.execs[0]["user"] is None and solve_run(sandbox)["user"] is None
+
+
+def test_no_solution_env_means_only_the_oracle_default(monkeypatch):
+    agent, sandbox, _ = make_agent(monkeypatch)
+    client = TestClient(agent.setup_webserver())
+    assert client.post("/v1/agent_sessions", json=seed_body(env={})).status_code == 200
+    assert client.post("/v1/responses", json=RESPONSES_BODY).status_code == 200
+    assert solve_run(sandbox)["env"] == {"DEBIAN_FRONTEND": "noninteractive"}
+
+
+def test_failing_solution_is_reported(monkeypatch):
     sandbox = FakeSandbox(result=SandboxExecResult(stdout="", stderr="boom", return_code=2))
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch, sandbox=sandbox)
+    agent, _, _ = make_agent(monkeypatch, sandbox=sandbox)
     client = TestClient(agent.setup_webserver())
     assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
 
@@ -239,9 +234,9 @@ def test_failing_solution_is_reported(tmp_path, monkeypatch):
     assert "boom" in payload["output"][0]["content"][0]["text"]
 
 
-def test_provider_error_type_is_reported(tmp_path, monkeypatch):
+def test_provider_error_type_is_reported(monkeypatch):
     sandbox = FakeSandbox(result=SandboxExecResult(stdout="", stderr="", return_code=137, error_type="timeout"))
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch, sandbox=sandbox)
+    agent, _, _ = make_agent(monkeypatch, sandbox=sandbox)
     client = TestClient(agent.setup_webserver())
     assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
 
@@ -252,10 +247,10 @@ def test_provider_error_type_is_reported(tmp_path, monkeypatch):
     assert "solve.sh exited with 137" in payload["output"][0]["content"][0]["text"]
 
 
-def test_missing_timeout_wrapper_is_a_wrapper_error_not_a_solution_failure(tmp_path, monkeypatch):
+def test_missing_timeout_wrapper_is_a_wrapper_error_not_a_solution_failure(monkeypatch):
     """The guard exits 127 before the log exists: the image lacks `timeout` or `bash`, solve.sh never ran."""
     sandbox = FakeSandbox(result=SandboxExecResult(stdout="", stderr="", return_code=127), log_present=False)
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch, sandbox=sandbox)
+    agent, _, _ = make_agent(monkeypatch, sandbox=sandbox)
     client = TestClient(agent.setup_webserver())
     assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
 
@@ -266,9 +261,9 @@ def test_missing_timeout_wrapper_is_a_wrapper_error_not_a_solution_failure(tmp_p
     assert "could not be started" in payload["output"][0]["content"][0]["text"]
 
 
-def test_solution_exiting_127_itself_is_a_solution_failure(tmp_path, monkeypatch):
+def test_solution_exiting_127_itself_is_a_solution_failure(monkeypatch):
     sandbox = FakeSandbox(result=SandboxExecResult(stdout="", stderr="foo: not found", return_code=127))
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch, sandbox=sandbox)
+    agent, _, _ = make_agent(monkeypatch, sandbox=sandbox)
     client = TestClient(agent.setup_webserver())
     assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
 
@@ -279,100 +274,49 @@ def test_solution_exiting_127_itself_is_a_solution_failure(tmp_path, monkeypatch
     assert "foo: not found" in payload["output"][0]["content"][0]["text"]
 
 
-def test_changed_folder_is_rejected(tmp_path, monkeypatch):
-    agent, task, _, _ = make_agent(tmp_path, monkeypatch)
-    client = TestClient(agent.setup_webserver())
-    assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
-    (task.path / "solution" / "solve.sh").write_text("#!/bin/bash\necho changed\n")
-
-    assert client.post("/v1/responses", json=RESPONSES_BODY).status_code == 409
-
-
-def test_seed_requires_sandbox_access(tmp_path, monkeypatch):
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch)
+def test_seed_requires_sandbox_access(monkeypatch):
+    agent, _, _ = make_agent(monkeypatch)
     client = TestClient(agent.setup_webserver())
     assert client.post("/v1/agent_sessions", json=seed_body(with_sandbox=False)).status_code == 422
 
 
-def test_responses_requires_seeded_session(tmp_path, monkeypatch):
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch)
+def test_seed_requires_the_task_agent_timeout(monkeypatch):
+    """The solve budget is the seed's agent_timeout_sec; without it the oracle has no task to read one from."""
+    agent, _, _ = make_agent(monkeypatch)
+    client = TestClient(agent.setup_webserver())
+    response = client.post("/v1/agent_sessions", json=seed_body(timeout=None))
+    assert response.status_code == 422
+    assert "agent_timeout_sec" in response.text
+
+
+def test_responses_requires_seeded_session(monkeypatch):
+    agent, _, _ = make_agent(monkeypatch)
     assert TestClient(agent.setup_webserver()).post("/v1/responses", json=RESPONSES_BODY).status_code == 404
 
 
-def test_legacy_run_route_is_not_supported(tmp_path, monkeypatch):
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch)
+def test_legacy_run_route_is_not_supported(monkeypatch):
+    agent, _, _ = make_agent(monkeypatch)
     response = TestClient(agent.setup_webserver()).post("/run", json={"responses_create_params": {"input": []}})
     assert response.status_code == 501
 
 
-@pytest.mark.parametrize("taskset,task_id,status", [("nope", "hello", 404), ("ds", "missing", 404)])
-def test_unknown_task_lookup(tmp_path, monkeypatch, taskset, task_id, status):
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch)
-    client = TestClient(agent.setup_webserver())
-    body = seed_body()
-    body["task_id"] = {"taskset": taskset, "task_id": task_id}
-    assert client.post("/v1/agent_sessions", json=body).status_code == 200
-    assert client.post("/v1/responses", json=RESPONSES_BODY).status_code == status
-
-
 @pytest.mark.parametrize("cap,expected", [(None, 7200.0), (8000.0, 7200.0), (60.0, 60.0), (0.5, 0.5)])
-def test_solve_uses_task_timeout_unless_explicitly_capped(tmp_path, monkeypatch, cap, expected):
-    agent, _, sandbox, _ = make_agent(tmp_path, monkeypatch, toml=TASK_TOML.replace("120.0", "7200.0"))
+def test_solve_uses_the_seeds_timeout_unless_explicitly_capped(monkeypatch, cap, expected):
+    agent, sandbox, _ = make_agent(monkeypatch)
     if cap is not None:
         agent.config.max_solve_timeout_s = cap
     client = TestClient(agent.setup_webserver())
-    assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
+    assert client.post("/v1/agent_sessions", json=seed_body(timeout=7200.0)).status_code == 200
     assert client.post("/v1/responses", json=RESPONSES_BODY).status_code == 200
     # The exec outlives the in-container `timeout` by the grace period.
-    run = next(call for call in sandbox.execs if "solve.sh" in call["command"])
+    run = solve_run(sandbox)
     assert run["timeout_s"] == expected + 60.0
     # The in-container budget is a whole number of seconds, never 0 (which would mean no limit).
     assert f"timeout -s KILL {max(1, math.ceil(expected))} bash" in run["command"]
 
 
-@pytest.mark.parametrize("present", [True, False])
-def test_solution_resolves_host_environment_before_execution(tmp_path, monkeypatch, present):
-    monkeypatch.delenv("ORACLE_TEST_GREETING", raising=False)
-    if present:
-        monkeypatch.setenv("ORACLE_TEST_GREETING", "from host")
-    agent, _, sandbox, _ = make_agent(
-        tmp_path, monkeypatch, toml=TASK_TOML.replace('GREETING = "hi"', 'GREETING = "${ORACLE_TEST_GREETING}"')
-    )
-    client = TestClient(agent.setup_webserver())
-    assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
-    response = client.post("/v1/responses", json=RESPONSES_BODY)
-    if present:
-        assert response.status_code == 200
-        env = next(call for call in sandbox.execs if "solve.sh" in call["command"])["env"]
-        assert env == {"DEBIAN_FRONTEND": "noninteractive", "GREETING": "from host"}
-    else:
-        assert response.status_code == 422
-        assert "ORACLE_TEST_GREETING" in response.text
-        assert not sandbox.execs and not sandbox.uploads
-
-
-def test_task_hashing_runs_outside_the_request_event_loop(tmp_path, monkeypatch):
-    import asyncio
-
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch)
-    original_load = module.load_task
-    loads = []
-
-    def load_without_event_loop(path):
-        with pytest.raises(RuntimeError, match="no running event loop"):
-            asyncio.get_running_loop()
-        loads.append(path)
-        return original_load(path)
-
-    monkeypatch.setattr(module, "load_task", load_without_event_loop)
-    client = TestClient(agent.setup_webserver())
-    assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
-    assert client.post("/v1/responses", json=RESPONSES_BODY).status_code == 200
-    assert len(loads) == 1
-
-
-def test_transient_disconnect_is_retried_by_base_session_lifecycle(tmp_path, monkeypatch):
-    agent, _, sandbox, _ = make_agent(tmp_path, monkeypatch)
+def test_transient_disconnect_is_retried_by_base_session_lifecycle(monkeypatch):
+    agent, sandbox, _ = make_agent(monkeypatch)
     attempts = []
 
     async def disconnect():
@@ -390,15 +334,18 @@ def test_transient_disconnect_is_retried_by_base_session_lifecycle(tmp_path, mon
     assert len(attempts) == 2 and sandbox.disconnected
 
 
-def test_transfer_failure_is_an_oracle_failure_not_a_500(tmp_path, monkeypatch):
-    from nemo_gym.sandbox.transfer import SandboxTransferError
+def test_unwritable_log_dir_is_an_oracle_failure_not_a_500(monkeypatch):
+    """An image whose user cannot make /logs/agent writable: scored as a failed oracle run, with the reason."""
 
-    agent, _, sandbox, _ = make_agent(tmp_path, monkeypatch)
+    class ReadOnlyLogs(FakeSandbox):
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=None, user=None, **kwargs):
+            await super().exec(command, cwd=cwd, env=env, timeout_s=timeout_s, user=user, **kwargs)
+            if command.startswith("mkdir -p /logs/agent"):
+                return SandboxExecResult(stdout="", stderr="operation not permitted", return_code=1)
+            return SandboxExecResult(stdout="", stderr="", return_code=0)
 
-    async def refuse(sandbox, source, target, **kwargs):
-        raise SandboxTransferError("Failed to unpack solution into /solution: operation not permitted")
-
-    monkeypatch.setattr(module, "upload_dir", refuse)
+    sandbox = ReadOnlyLogs()
+    agent, _, _ = make_agent(monkeypatch, sandbox=sandbox)
     client = TestClient(agent.setup_webserver())
     assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
 
@@ -408,29 +355,27 @@ def test_transfer_failure_is_an_oracle_failure_not_a_500(tmp_path, monkeypatch):
     payload = response.json()
     assert payload["metadata"] == {"oracle": "failed", "oracle_error_type": "transfer"}
     assert "operation not permitted" in payload["output"][0]["content"][0]["text"]
-    assert not any("solve.sh" in call["command"] for call in sandbox.execs)
+    assert not any("bash /solution/solve.sh" in call["command"] for call in sandbox.execs)
 
 
-def test_provider_failure_during_transfer_is_not_scored_as_an_oracle_failure(tmp_path, monkeypatch):
-    """A lost sandbox or provider timeout propagates (a retryable failed episode) instead of `oracle=failed`."""
-    from nemo_gym.sandbox.transfer import SandboxUnavailableError
+def test_provider_error_in_the_probe_is_not_scored(monkeypatch):
+    """A lost sandbox answering the solve.sh probe propagates (a retryable failed episode), never `unvalidated`."""
 
-    agent, _, sandbox, _ = make_agent(tmp_path, monkeypatch)
+    class Lost(FakeSandbox):
+        async def exec(self, command, *, cwd=None, env=None, timeout_s=None, user=None, **kwargs):
+            await super().exec(command, cwd=cwd, env=env, timeout_s=timeout_s, user=user, **kwargs)
+            return SandboxExecResult(stdout="", stderr="container gone", return_code=1, error_type="sandbox")
 
-    async def lost(sandbox, source, target, **kwargs):
-        raise SandboxUnavailableError("The sandbox could not run 'mkdir -p /solution': timeout: ")
-
-    monkeypatch.setattr(module, "upload_dir", lost)
+    sandbox = Lost()
+    agent, _, _ = make_agent(monkeypatch, sandbox=sandbox)
     client = TestClient(agent.setup_webserver(), raise_server_exceptions=False)
     assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
-
     response = client.post("/v1/responses", json=RESPONSES_BODY)
-
     assert response.status_code == 500, response.text
-    assert not any("solve.sh" in call["command"] for call in sandbox.execs)
+    assert [call["command"] for call in sandbox.execs] == ["test -f /solution/solve.sh"]
 
 
-def test_provider_error_in_the_log_dir_setup_is_not_scored_either(tmp_path, monkeypatch):
+def test_provider_error_in_the_log_dir_setup_is_not_scored_either(monkeypatch):
     """`exec_as_root` turns a provider `error_type` into the same propagating failure."""
 
     class Lost(FakeSandbox):
@@ -441,9 +386,9 @@ def test_provider_error_in_the_log_dir_setup_is_not_scored_either(tmp_path, monk
             return SandboxExecResult(stdout="", stderr="", return_code=0)
 
     sandbox = Lost()
-    agent, _, _, _ = make_agent(tmp_path, monkeypatch, sandbox=sandbox)
+    agent, _, _ = make_agent(monkeypatch, sandbox=sandbox)
     client = TestClient(agent.setup_webserver(), raise_server_exceptions=False)
     assert client.post("/v1/agent_sessions", json=seed_body()).status_code == 200
     response = client.post("/v1/responses", json=RESPONSES_BODY)
     assert response.status_code == 500, response.text
-    assert not any("solve.sh" in call["command"] for call in sandbox.execs)
+    assert not any("bash /solution/solve.sh" in call["command"] for call in sandbox.execs)

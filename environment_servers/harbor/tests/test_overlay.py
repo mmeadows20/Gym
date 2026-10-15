@@ -523,10 +523,15 @@ class TestOverlay:
     def test_sandbox_ttls_stay_episode_sized_when_there_is_an_overlay(self, tmp_path, monkeypatch):
         server, task, _, _ = self.overlay_server(tmp_path, monkeypatch)
         config, slack = task.config, server.config.sandbox_ttl_slack_s
-        assert config.environment.build_timeout_sec == 600 and task.overlay
-        episode = server.config.default_episode_timeout_seconds + server.config.cleanup_timeout_seconds
-        # The agent sandbox lives for the environment's whole episode, which already covers the overlay.
-        assert server._sandbox_spec(task, "/app").ttl_s == episode + slack
+        build, ready = config.environment.build_timeout_sec, server.config.sandbox_ready_timeout_s
+        cleanup = server.config.cleanup_timeout_seconds
+        assert build == 600 and task.overlay
+        # The agent sandbox lives for the task's whole episode budget: one sandbox start, the overlay, harness
+        # setup, the agent and the shared verifier with its grace; the overlay needs no budget of its own.
+        budget = ready + build + server.config.harness_setup_allowance_s
+        budget += config.agent.timeout_sec + config.verifier.timeout_sec + server.config.verifier_grace_s
+        assert server._task_budget_s(task) == budget
+        assert server._sandbox_spec(task, "/app").ttl_s == budget + cleanup + slack
 
         # A separate verifier in the task's own image: Harbor's effective verifier environment is a copy of
         # [environment] carrying its docker_image, a prebuilt image that resolves no overlay (the loader admits the
@@ -537,7 +542,10 @@ class TestOverlay:
         )
         server, task, _, _ = self.overlay_server(tmp_path, monkeypatch, toml=toml)
         assert not task.overlay and task.verifier_image is None
-        assert server._sandbox_spec(task, "/app").ttl_s == episode + slack
+        # No overlay, so no build budget anywhere; the separate verifier adds its own sandbox start.
+        separate_budget = budget - build + ready
+        assert server._task_budget_s(task) == separate_budget
+        assert server._sandbox_spec(task, "/app").ttl_s == separate_budget + cleanup + slack
         specs = []
 
         class RecordingSandbox:
@@ -553,7 +561,7 @@ class TestOverlay:
         # The verifier gets the same episode-sized lifetime: `timeout_sec + slack` would not clear a provider's
         # renew interval (TB4's 1800 s), which masks every separate-mode episode (M10 smVVP).
         agent_spec = server._sandbox_spec(task, "/app")
-        assert verifier_spec.ttl_s == agent_spec.ttl_s == episode + slack >= 1800 + config.verifier.timeout_sec
+        assert verifier_spec.ttl_s == agent_spec.ttl_s >= 1800 + config.verifier.timeout_sec
         assert verifier_spec.image == task.image == "debian:bookworm-slim"
         assert verifier_spec.env == agent_spec.env
 

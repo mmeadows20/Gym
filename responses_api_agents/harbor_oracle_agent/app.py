@@ -4,20 +4,19 @@
 """Oracle agent: run a Harbor task's reference solution instead of a model.
 
 The oracle is an agent harness like any other. It borrows the sandbox the ``harbor``
-environment server seeded, finds the task folder through that server's taskset mapping
-in the run config, uploads ``solution/`` and runs ``solve.sh``. Verification then
-scores the result the same way it scores a model's work, so ``gym dataset validate``
-is an ordinary run with this agent selected.
+environment server seeded, where that server placed the task's ``solution/`` at ``/solution``
+because the agent it serves is this oracle, and runs ``bash /solution/solve.sh`` as the task
+user within the ``[agent].timeout_sec`` the seed request carries. Verification then scores the
+result the same way it scores a model's work, so ``gym dataset validate`` is an ordinary run
+with this agent selected. The oracle never reads a task folder itself: the task, its digest and
+its solution are the environment server's.
 
-A task without ``solution/solve.sh`` is not failed: the oracle returns a response
-tagged ``oracle=unvalidated`` and does nothing in the sandbox.
+A task without ``solution/solve.sh`` is not failed: the oracle returns a response tagged
+``oracle=unvalidated`` and does nothing in the sandbox.
 """
 
-import asyncio
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from time import time
 from typing import Any
 from uuid import uuid4
@@ -25,7 +24,7 @@ from uuid import uuid4
 from fastapi import Body, HTTPException, Request
 from pydantic import Field
 
-from environment_servers.harbor.session import resolve_env_templates
+from environment_servers.harbor.session import SOLUTION_DIR
 from environment_servers.harbor.verifier import TIMEOUT_WRAPPER_GUARD
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
@@ -35,8 +34,7 @@ from nemo_gym.base_responses_api_agent import (
     BaseResponsesAPIAgentConfig,
     SimpleResponsesAPIAgent,
 )
-from nemo_gym.config_types import EnvironmentServerRef
-from nemo_gym.global_config import get_first_server_config_dict, get_global_config_dict
+from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
@@ -50,12 +48,10 @@ from nemo_gym.sandbox import AsyncSandbox
 from nemo_gym.sandbox.access import DirectSandboxConnection
 from nemo_gym.sandbox.config import resolve_provider_config
 from nemo_gym.sandbox.providers import create_provider
-from nemo_gym.sandbox.transfer import SandboxTransferError, exec_as_root, upload_dir
-from nemo_gym.tasks.harbor import HarborTask, load_task
-from nemo_gym.tasks.harbor.errors import HarborTaskError
+from nemo_gym.sandbox.transfer import SandboxTransferError, SandboxUnavailableError, exec_as_root
 
 
-SOLUTION_DIR = "/solution"
+SOLVE_SCRIPT = f"{SOLUTION_DIR}/solve.sh"
 SOLVE_LOG_DIR = "/logs/agent"
 # Harbor's oracle writes its output under this name, so tools written for Harbor find the log.
 SOLVE_LOG = f"{SOLVE_LOG_DIR}/oracle.txt"
@@ -73,9 +69,6 @@ class OracleAgentConfig(BaseResponsesAPIAgentConfig):
     # Like every other harness config, this one tolerates the keys the run config puts on an agent block
     # (`datasets`, carried by the generated per-taskset agent) without declaring them.
 
-    # The `harbor` environment server whose `tasksets` mapping locates task folders. Unset, the oracle
-    # reads the mapping of every environment server whose `agent_server` names this agent.
-    environment_server: EnvironmentServerRef | None = None
     # Wall-clock cap for solve.sh when the task's [agent].timeout_sec is larger.
     max_solve_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     output_tail_chars: int = 4000
@@ -85,6 +78,11 @@ class OracleAgentConfig(BaseResponsesAPIAgentConfig):
 class OracleSession(AgentSessionState):
     sandbox: AsyncSandbox
     workdir: str
+    # The task user and the `[solution].env` the environment server resolved, from the sandbox access.
+    user: str | int | None
+    env: dict[str, str]
+    # The solve.sh budget: the task's `[agent].timeout_sec` from the seed, under `max_solve_timeout_s`.
+    timeout_s: float
 
 
 class OracleAgent(SimpleResponsesAPIAgent):
@@ -105,61 +103,36 @@ class OracleAgent(SimpleResponsesAPIAgent):
         if self.config.num_workers not in (None, 1):
             raise ValueError("Process-local oracle sessions require num_workers=1")
 
-    # -- task lookup -----------------------------------------------------------------------
-
-    def _tasksets(self) -> dict[str, Any]:
-        """The taskset mappings of the environment server(s) this oracle serves."""
-        config = get_global_config_dict()
-        if self.config.environment_server is not None:
-            servers = [get_first_server_config_dict(config, self.config.environment_server.name)]
-        else:
-            servers = [
-                server
-                for instance in config.values()
-                if isinstance(instance, Mapping) and isinstance(instance.get("environment_servers"), Mapping)
-                for server in instance["environment_servers"].values()
-                if isinstance(server, Mapping) and (server.get("agent_server") or {}).get("name") == self.config.name
-            ]
-        tasksets: dict[str, Any] = {}
-        for server in servers:
-            tasksets.update(server.get("tasksets") or {})
-        return tasksets
-
-    def _task_folder(self, taskset: str, task_id: str) -> tuple[Path, str]:
-        """The task folder and materialized digest from the environment server's taskset mapping."""
-        mapping = self._tasksets().get(taskset)
-        if mapping is None:
-            raise HTTPException(404, f"Taskset {taskset!r} is not in the environment server's taskset mapping")
-        digest = (mapping.get("tasks") or {}).get(task_id)
-        if digest is None:
-            raise HTTPException(404, f"Task {task_id!r} is not in taskset {taskset!r}")
-        return Path(mapping["folder"]) / task_id, str(digest)
-
-    def _load_task(self, taskset: str, task_id: str) -> HarborTask:
-        folder, digest = self._task_folder(taskset, task_id)
-        try:
-            task = load_task(folder)
-        except HarborTaskError as exc:
-            raise HTTPException(422, str(exc)) from exc
-        if task.digest != digest:
-            raise HTTPException(409, f"Task folder {folder} changed since materialization")
-        return task
-
     # -- sessions --------------------------------------------------------------------------
 
     async def _seed_agent_session_state(self, body: AgentSeedSessionRequest) -> OracleSession:
         if body.sandbox_access is None:
             raise HTTPException(422, "The oracle agent needs sandbox_access from the environment server")
+        if body.agent_timeout_sec is None:
+            raise HTTPException(
+                422,
+                "The oracle agent needs agent_timeout_sec (the task's [agent].timeout_sec) from the environment server",
+            )
         connection = body.sandbox_access.connection
         if not isinstance(connection, DirectSandboxConnection):
             raise HTTPException(422, "The oracle agent supports only direct sandbox connections")
+        timeout = body.agent_timeout_sec
+        if self.config.max_solve_timeout_s is not None:
+            timeout = min(timeout, self.config.max_solve_timeout_s)
         provider = create_provider(resolve_provider_config(connection.provider_config_ref, get_global_config_dict()))
         try:
             sandbox = await AsyncSandbox.connect(connection.descriptor, provider=provider)
         except BaseException:
             await provider.aclose()
             raise
-        return OracleSession(request=body, sandbox=sandbox, workdir=body.sandbox_access.workdir)
+        return OracleSession(
+            request=body,
+            sandbox=sandbox,
+            workdir=body.sandbox_access.workdir,
+            user=body.sandbox_access.user,
+            env=dict(body.sandbox_access.env),
+            timeout_s=timeout,
+        )
 
     async def _close_agent_session_state(self, state: AgentSessionState) -> AgentCloseSessionResponse:
         if not isinstance(state, OracleSession):
@@ -182,18 +155,22 @@ class OracleAgent(SimpleResponsesAPIAgent):
         self, request: Request, body: NeMoGymResponseCreateParamsNonStreaming = Body()
     ) -> NeMoGymResponse:
         session = self._session_for(request)
-        task_id = session.request.task_id
-        task = await asyncio.to_thread(self._load_task, task_id.taskset, task_id.task_id)
-        if not task.has_solution:
-            return self._response(body, ORACLE_STATUS_UNVALIDATED, "No solution/solve.sh in the task folder.", {})
+        # The environment server put the solution in place for this harness; a task that ships none left
+        # nothing there. The probe runs as the task user, who must be able to reach the script.
+        present = await session.sandbox.exec(f"test -f {SOLVE_SCRIPT}", cwd="/", timeout_s=60, user=session.user)
+        if present.error_type:
+            # The provider, not the task: the episode fails as retryable rather than scoring an absent solution.
+            raise SandboxUnavailableError(
+                f"The sandbox could not probe {SOLVE_SCRIPT}: {present.error_type}: {present.stderr or present.stdout or ''}"
+            )
+        if present.return_code != 0:
+            return self._response(
+                body, ORACLE_STATUS_UNVALIDATED, f"No solution/solve.sh in the task ({SOLVE_SCRIPT}).", {}
+            )
 
-        settings = task.config
-        timeout = settings.agent.timeout_sec
-        if self.config.max_solve_timeout_s is not None:
-            timeout = min(timeout, self.config.max_solve_timeout_s)
-        env = {"DEBIAN_FRONTEND": "noninteractive", **resolve_env_templates(settings.solution.env)}
+        timeout = session.timeout_s
+        env = {"DEBIAN_FRONTEND": "noninteractive", **session.env}
         try:
-            await upload_dir(session.sandbox, task.path / "solution", SOLUTION_DIR, make_readable=True)
             # The folder may already exist root-owned and world-writable (Harbor's /logs mount, or a
             # derived image); only its writability matters.
             prepared = await exec_as_root(
@@ -204,22 +181,22 @@ class OracleAgent(SimpleResponsesAPIAgent):
             if prepared.return_code:
                 raise SandboxTransferError(f"{SOLVE_LOG_DIR} is not writable: {prepared.stderr or prepared.stdout}")
         except SandboxTransferError as exc:
-            # The sandbox user cannot place the solution where solve.sh expects it (for example an image
-            # that runs as a non-root user without the capability to switch to root). Report it as an
-            # oracle failure so the row stays scored and the reason is visible. A provider failure
-            # (`SandboxUnavailableError`: timeout, lost container) is not caught: it propagates and the
-            # episode fails as retryable instead of being scored as a failed reference solution.
+            # The sandbox user cannot make the log folder solve.sh writes to (for example an image that runs
+            # as a non-root user without the capability to switch to root). Report it as an oracle failure
+            # so the row stays scored and the reason is visible. A provider failure (`SandboxUnavailableError`:
+            # timeout, lost container) is not caught: it propagates and the episode fails as retryable
+            # instead of being scored as a failed reference solution.
             return self._response(body, ORACLE_STATUS_FAILED, str(exc), {"oracle_error_type": "transfer"})
         # One bounded exec: the provider keeps the command alive for `timeout_s`, and `timeout`
         # inside the container stops the solution itself (a sub-second budget still gets a whole
         # second: `timeout 0` means no limit). Output goes to a file we tail.
         result = await session.sandbox.exec(
             f"{TIMEOUT_WRAPPER_GUARD}; "
-            f"timeout -s KILL {max(1, math.ceil(timeout))} bash {SOLUTION_DIR}/solve.sh > {SOLVE_LOG} 2>&1",
+            f"timeout -s KILL {max(1, math.ceil(timeout))} bash {SOLVE_SCRIPT} > {SOLVE_LOG} 2>&1",
             cwd=session.workdir,
             env=env,
             timeout_s=timeout + SOLVE_GRACE_S,
-            user=task.user,
+            user=session.user,
             preserve_background_services=True,
         )
         tail = self.config.output_tail_chars

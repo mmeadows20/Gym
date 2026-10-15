@@ -142,3 +142,13 @@ def test_seed_response_carries_the_harness_task_tool_context_declaration() -> No
         )
     # The field has a default so an older harness's reply still validates, as not supporting it.
     assert AgentSeedSessionResponse.model_validate({"agent_session_id": "x"}).supports_task_tool_context is False
+
+
+def test_agent_session_seed_carries_the_tasks_agent_timeout() -> None:
+    """The environment server hands the task's `[agent].timeout_sec` to the harness in the seed."""
+    seed = _seed_request()
+    assert seed.agent_timeout_sec is None and "agent_timeout_sec" in seed.model_dump(mode="json")
+    timed = AgentSeedSessionRequest.model_validate({**seed.model_dump(mode="json"), "agent_timeout_sec": 900.0})
+    assert timed.agent_timeout_sec == 900.0
+    with pytest.raises(ValidationError):
+        AgentSeedSessionRequest.model_validate({**seed.model_dump(mode="json"), "agent_timeout_sec": 0})

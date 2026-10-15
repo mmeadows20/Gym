@@ -62,6 +62,9 @@ storage_mb = 10240
 IMAGE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
+SOLVE_SH = "#!/bin/bash\necho hi > hello.txt\n"
+
+
 def write_image_config(parent: Path, image: str, **config) -> None:
     """Record ``image``'s OCI configuration next to the task folders, as preparing the dataset does."""
     path = parent / IMAGE_CONFIGS_FILE
@@ -82,6 +85,7 @@ def write_task(
     toml: str = TASK_TOML,
     dockerfile: str = "FROM ubuntu:24.04\nWORKDIR /app",
     image_config: dict | None = None,
+    solution: bool = False,
 ) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     (root / "task.toml").write_text(toml)
@@ -90,6 +94,16 @@ def write_task(
     (root / "environment" / "Dockerfile").write_text(dockerfile)
     (root / "tests").mkdir(exist_ok=True)
     (root / "tests" / "test.sh").write_text("#!/bin/bash\necho 1 > /logs/verifier/reward.txt\n")
+    if solution:
+        # A reference solution with a subfolder, an author's private mode on the script, and an editor
+        # leftover the task digest skips; the digest covers solution/, so it is written before the load.
+        (root / "solution").mkdir(exist_ok=True)
+        (root / "solution" / "solve.sh").write_text(SOLVE_SH)
+        (root / "solution" / "solve.sh").chmod(0o700)
+        (root / "solution" / "data").mkdir(exist_ok=True)
+        (root / "solution" / "data" / "answer.txt").write_text("42\n")
+        (root / "solution" / "__pycache__").mkdir(exist_ok=True)
+        (root / "solution" / "__pycache__" / "x.pyc").write_bytes(b"\x00")
     # The loader resolves the Dockerfile against its base image's configuration, recorded at prepare.
     write_image_config(root.parent, dockerfile.split()[1], **(image_config or {"Env": [f"PATH={IMAGE_PATH}"]}))
     return root
@@ -338,9 +352,11 @@ class FakeAgentClient(ServerClient):
         return [call[1] for call in self.calls]
 
 
-def make_client() -> FakeAgentClient:
+def make_client(implementation: str = "test") -> FakeAgentClient:
+    """``implementation`` is the key under the agent instance's ``responses_api_agents`` block in the run config:
+    the server reads it to tell the oracle (``harbor_oracle_agent``) from every other harness."""
     global_config = OmegaConf.create(
-        {"agent": {"responses_api_agents": {"test": {"host": "agent", "port": 8001, "entrypoint": "app.py"}}}}
+        {"agent": {"responses_api_agents": {implementation: {"host": "agent", "port": 8001, "entrypoint": "app.py"}}}}
     )
     return FakeAgentClient(
         head_server_config=BaseServerConfig(host="head", port=1),
@@ -359,10 +375,14 @@ def make_server(
     toml: str = TASK_TOML,
     dockerfile: str = "FROM ubuntu:24.04\nWORKDIR /app",
     image_config: dict | None = None,
+    agent_implementation: str = "test",
+    solution: bool = False,
     **config_overrides,
 ):
     folder = tmp_path / "datasets" / "ds"
-    task = load_task(write_task(folder / "hello", toml=toml, dockerfile=dockerfile, image_config=image_config))
+    task = load_task(
+        write_task(folder / "hello", toml=toml, dockerfile=dockerfile, image_config=image_config, solution=solution)
+    )
     config = HarborEnvironmentServerConfig(
         host="0.0.0.0",
         port=8080,
@@ -374,7 +394,7 @@ def make_server(
         cleanup_timeout_seconds=10,
         **config_overrides,
     )
-    server = HarborEnvironmentServer(config=config, server_client=make_client())
+    server = HarborEnvironmentServer(config=config, server_client=make_client(agent_implementation))
     sandbox = sandbox or FakeSandbox()
     created: list[tuple] = []
 
