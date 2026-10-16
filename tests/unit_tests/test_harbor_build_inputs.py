@@ -12,12 +12,7 @@ import pytest
 
 import nemo_gym.tasks.harbor.prepare_builds as prepare_builds
 from nemo_gym.tasks.harbor.build_plan import DEFAULT_PLATFORM, BuildError, plan_builds
-from nemo_gym.tasks.harbor.build_records import (
-    build_inputs_digest,
-    build_inputs_mismatch,
-    pop_stale_build_inputs,
-    settle_entry,
-)
+from nemo_gym.tasks.harbor.build_records import build_inputs_digest, build_inputs_mismatch, settle_entry
 from nemo_gym.tasks.harbor.build_tools import ImageBuilder
 from nemo_gym.tasks.harbor.digest import context_digest, inputs_digest
 from nemo_gym.tasks.harbor.image_build import build_images
@@ -53,6 +48,16 @@ INLINE_COMPOSE = (
 CONTEXT_DIR_COMPOSE = (
     "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n    build:\n"
     "      context: ${CONTEXT_DIR}\n      dockerfile: ${CONTEXT_DIR}/Dockerfile\n"
+)
+# A sidecar built from its own folder, with an argument from the build's environment; main needs no argument.
+SIDECAR_ARG_COMPOSE = (
+    "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n"
+    "  world:\n    build:\n      context: ./world\n      args:\n        - FOO\n"
+)
+# A sidecar whose label interpolates REV: nothing of main's build reads it.
+SIDECAR_LABEL_COMPOSE = (
+    "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n"
+    "  world:\n    build:\n      context: ./world\n      labels:\n        rev: ${REV}\n"
 )
 
 
@@ -307,7 +312,8 @@ class TestReuse:
         assert len([call for call in tool.calls if call[-1] == "build"]) == 3
         assert build_images(folder, builder=builder, log=lambda _: None) == []
 
-    def test_an_image_recorded_without_the_digest_is_rebuilt_once(self, tmp_path):
+    @pytest.mark.parametrize("shape", ["services", "legacy"])
+    def test_an_image_recorded_without_the_digest_is_rebuilt_once(self, tmp_path, shape):
         folder = tmp_path / "ds"
         write_task(folder / "a")
         builder, tool = local_docker()
@@ -315,17 +321,79 @@ class TestReuse:
         configs = read_image_configs(folder)
         del configs[first.image]["inputs_digest"]
         (folder / IMAGE_CONFIGS_FILE).write_text(json.dumps(configs))
+        built = read_built_images(folder)
+        if shape == "legacy":
+            # An entry of main alone, written before sidecars were built, names the same image.
+            del built[first.digest]["services"]
+            (folder / "built-images.json").write_text(json.dumps(built))
         (entry,) = plan_builds(folder)
-        recorded = read_built_images(folder)
-        recorded["not-a-context"] = "junk"  # an entry that is not a mapping is left alone
-        stale = pop_stale_build_inputs(recorded, [entry], configs, repository=None, platform=DEFAULT_PLATFORM)
-        assert [(e.digest, why) for e, _, why in stale] == [(first.digest, UNRECORDED)]
-        assert recorded == {"not-a-context": "junk"}
+        assert build_inputs_mismatch(entry, built[first.digest], configs, repository=None, platform=None) == UNRECORDED
         lines: list[str] = []
         (again,) = build_images(folder, builder=builder, log=lines.append)
         assert lines[0] == f"Rebuilding {first.image} for a: {UNRECORDED}"
         assert recorded_inputs(folder, again.image) == again.record["inputs_digest"]
         assert build_images(folder, builder=builder, log=lambda _: None) == []
+
+    def test_each_service_of_a_context_is_judged_by_its_own_inputs(self, tmp_path, monkeypatch):
+        folder = tmp_path / "ds"
+        files = {
+            "tools/setup.sh": "true\n",
+            "docker-compose.yaml": SIDECAR_ARG_COMPOSE,
+            "world/Dockerfile": "FROM x\n",
+        }
+        write_task(folder / "a", extra=files)
+        builder, tool = local_docker()
+        monkeypatch.setenv("FOO", "1")
+        main, world = build_images(folder, builder=builder, log=lambda _: None)
+        assert (main.service, world.service) == ("main", "world") and main.digest == world.digest
+        # One tree, two settings: each image's record carries the digest of its own build.
+        assert (
+            recorded_inputs(folder, main.image)
+            == task_inputs_digest(folder / "a")
+            != recorded_inputs(folder, world.image)
+        )
+        assert recorded_inputs(folder, world.image) == task_inputs_digest(folder / "a", service="world")
+        # The sidecar's argument changes: the sidecar is rebuilt under its name, main is reused as recorded.
+        monkeypatch.setenv("FOO", "2")
+        lines: list[str] = []
+        (again,) = build_images(folder, builder=builder, log=lines.append)
+        assert again.service == "world" and again.tag == world.tag
+        assert lines[:2] == [
+            f"Built image recorded for a: {main.image}",
+            f"Rebuilding {world.image} for a (world): {CHANGED}",
+        ]
+        assert recorded_inputs(folder, main.image) == main.record["inputs_digest"]
+        assert recorded_inputs(folder, world.image) == again.record["inputs_digest"] != world.record["inputs_digest"]
+        # A sidecar image recorded without the digest is rebuilt alone too.
+        configs = read_image_configs(folder)
+        del configs[world.image]["inputs_digest"]
+        (folder / IMAGE_CONFIGS_FILE).write_text(json.dumps(configs))
+        lines.clear()
+        (once_more,) = build_images(folder, builder=builder, log=lines.append)
+        assert once_more.service == "world" and lines[1] == f"Rebuilding {world.image} for a (world): {UNRECORDED}"
+
+    def test_a_variable_in_a_sidecars_section_rebuilds_the_sidecar_alone(self, tmp_path, monkeypatch):
+        folder = tmp_path / "ds"
+        files = {
+            "tools/setup.sh": "true\n",
+            "docker-compose.yaml": SIDECAR_LABEL_COMPOSE,
+            "world/Dockerfile": "FROM x\n",
+        }
+        write_task(folder / "a", extra=files)
+        builder, tool = local_docker()
+        monkeypatch.setenv("REV", "r1")
+        main, world = build_images(folder, builder=builder, log=lambda _: None)
+        assert build_images(folder, builder=builder, log=lambda _: None) == []
+        monkeypatch.setenv("REV", "r2")
+        lines: list[str] = []
+        (again,) = build_images(folder, builder=builder, log=lines.append)
+        assert again.service == "world" and again.tag == world.tag and again.digest == main.digest
+        assert lines[:2] == [
+            f"Built image recorded for a: {main.image}",
+            f"Rebuilding {world.image} for a (world): {CHANGED}",
+        ]
+        assert recorded_inputs(folder, main.image) == main.record["inputs_digest"]
+        assert recorded_inputs(folder, world.image) == again.record["inputs_digest"] != world.record["inputs_digest"]
 
     def test_a_compose_file_the_build_refuses_is_reported_and_the_rebuild_fails_with_it(self, tmp_path):
         folder = tmp_path / "ds"

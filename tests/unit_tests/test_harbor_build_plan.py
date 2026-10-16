@@ -12,7 +12,7 @@ import shutil
 
 import pytest
 
-from nemo_gym.tasks.harbor.build_plan import detect_tool, needs_build, plan_builds
+from nemo_gym.tasks.harbor.build_plan import BuildError, detect_tool, needs_build, plan_builds
 from nemo_gym.tasks.harbor.digest import context_digest
 from nemo_gym.tasks.harbor.harbor_compat import environment_content_hash
 from tests.unit_tests.harbor_build_helpers import (
@@ -23,6 +23,8 @@ from tests.unit_tests.harbor_build_helpers import (
     TOML,
     UBUNTU_RECORD,
     harbor_hash,
+    settled,
+    tagged_buildah,
     write_base_record,
     write_task,
 )
@@ -110,6 +112,114 @@ class TestPlan:
         task = write_task(tmp_path / "solo")
         (plan,) = plan_builds(task)
         assert plan.tasks == ("solo",)
+
+    # G2: counselbench's and kumo's shapes, main with a build section, one sidecar without image: and one with.
+    SIDECAR_COMPOSE = (
+        "services:\n"
+        "  main:\n"
+        "    image: ${MAIN_IMAGE_NAME}\n"
+        "    build:\n"
+        "      context: .\n"
+        "  cache:\n"
+        "    image: redis:7\n"
+        "  world:\n"
+        "    build:\n"
+        "      context: .\n"
+        "      dockerfile: world/Dockerfile\n"
+        "  verifier:\n"
+        "    image: ${MAIN_IMAGE_NAME}_verifier\n"
+        "    build:\n"
+        "      context: ${CONTEXT_DIR}\n"
+        "      dockerfile: Dockerfile_verifier\n"
+    )
+    SIDECAR_FILES = {
+        "docker-compose.yaml": SIDECAR_COMPOSE,
+        "world/Dockerfile": "FROM python:3.12-slim\nCOPY world/ /opt/world/\n",
+        "Dockerfile_verifier": "FROM python:3.12-slim\nCOPY tests/ /tests/\n",
+        "tools/setup.sh": "#!/bin/sh\necho ok\n",
+    }
+
+    def test_every_service_with_a_build_section_is_planned_main_first(self, tmp_path):
+        folder = tmp_path / "ds"
+        write_task(folder / "a", extra=self.SIDECAR_FILES)
+        write_task(folder / "b", extra=self.SIDECAR_FILES)  # same context: the same three services, shared
+        context = (folder / "a" / "environment").resolve()
+        plan = plan_builds(folder)
+        # One entry per (context, service), main first and the sidecars in file order; a sidecar with image: and
+        # no build: (cache) is pulled, not built.
+        assert [(entry.service, entry.tasks) for entry in plan] == [
+            ("main", ("a", "b")),
+            ("world", ("a", "b")),
+            ("verifier", ("a", "b")),
+        ]
+        assert {entry.digest for entry in plan} == {context_digest(context)} == {harbor_hash(context)}
+        assert all(entry.context == context for entry in plan)
+        # Planning reads only the build keys; the sections resolve at build time, each under environment/.
+        assert all(entry.build_dir == context and entry.dockerfile == "Dockerfile" for entry in plan)
+        main, world, verifier = (settled(entry) for entry in plan)
+        assert main.dockerfile_path == context / "Dockerfile"
+        assert world.build_dir == context and world.dockerfile_path == context / "world" / "Dockerfile"
+        assert verifier.build_dir == context and verifier.dockerfile_path == context / "Dockerfile_verifier"
+
+    def test_a_sidecar_is_planned_whatever_mains_mode(self, tmp_path):
+        folder = tmp_path / "ds"
+        compose = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n  runtime:\n    build: ./runtime\n"
+        files = {"docker-compose.yaml": compose, "runtime/Dockerfile": "FROM python:3.12\nCOPY . /app\n"}
+        # Overlay-mode main (itsm-bench), pull-mode main, a prebuilt main, and a compose file without main.
+        write_task(folder / "overlay", dockerfile=OVERLAY_DOCKERFILE, extra=files)
+        write_task(folder / "pull", dockerfile=PULL_DOCKERFILE, extra=files)
+        write_task(folder / "prebuilt", toml=TOML + 'docker_image = "org/prebuilt:1"\n', extra=files)
+        write_task(
+            folder / "no-main",
+            dockerfile=PULL_DOCKERFILE,
+            extra={**files, "docker-compose.yaml": "services:\n  runtime:\n    build: ./runtime\n"},
+        )
+        # A sidecar with image: only, and a Compose spelling Harbor never reads, plan nothing.
+        write_task(
+            folder / "pulled",
+            dockerfile=PULL_DOCKERFILE,
+            extra={"docker-compose.yaml": "services:\n  db:\n    image: redis:7\n"},
+        )
+        write_task(
+            folder / "other-name",
+            dockerfile=PULL_DOCKERFILE,
+            extra={"compose.yaml": compose, "runtime/Dockerfile": "FROM x\n"},
+        )
+        write_base_record(folder)
+        plan = plan_builds(folder)
+        assert [(entry.service, entry.tasks) for entry in plan] == [
+            ("runtime", ("no-main",)),
+            ("runtime", ("overlay",)),
+            ("runtime", ("prebuilt",)),
+            ("runtime", ("pull",)),
+        ]
+        assert all(entry.context == (folder / entry.tasks[0] / "environment").resolve() for entry in plan)
+        # A file that does not parse is left for the loader; the task's main still plans on its own.
+        write_task(folder / "broken", extra={"docker-compose.yaml": "services: [\n"})
+        assert [(e.service, e.tasks) for e in plan_builds(folder / "broken")] == [("main", ("broken",))]
+
+    def test_tasks_sharing_a_context_plan_main_when_any_of_them_needs_it(self, tmp_path):
+        folder = tmp_path / "ds"
+        compose = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n  db:\n    build: ./db\n"
+        files = {"docker-compose.yaml": compose, "db/Dockerfile": "FROM postgres:16\n"}
+        write_task(folder / "a", extra=files)
+        write_task(folder / "b", extra=files)
+        # a is prebuilt by a dataset override and plans db alone; b shares the context and needs main built too.
+        (folder / "dataset.toml").write_text('[gym.tasks."a".environment]\ndocker_image = "org/pinned:2"\n')
+        assert [(e.service, e.tasks) for e in plan_builds(folder)] == [("main", ("a", "b")), ("db", ("a", "b"))]
+
+    def test_a_sidecar_context_outside_the_environment_is_refused_naming_the_service(self, tmp_path):
+        folder = tmp_path / "ds"
+        compose = "services:\n  main:\n    image: ${MAIN_IMAGE_NAME}\n  db:\n    build: ../x\n"
+        write_task(folder / "a", extra={"docker-compose.yaml": compose})
+        main, db = plan_builds(folder)
+        assert (main.service, db.service) == ("main", "db")
+        builder, fake = tagged_buildah(tmp_path)
+        with pytest.raises(
+            BuildError, match=r"services\.db\.build\.context is refused.*outside the task's environment"
+        ):
+            list(builder.build_many([main, db]))
+        assert fake.calls == []
 
     def test_detect_tool_needs_docker_without_a_repository(self, monkeypatch):
         monkeypatch.setattr(

@@ -14,7 +14,7 @@ import subprocess
 
 import pytest
 
-from environment_servers.harbor.overlay import OVERLAY_FAILED_KIND, overlay_shell_command, overlay_workdir_command
+from environment_servers.harbor.overlay import overlay_shell_command, overlay_workdir_command
 from environment_servers.harbor.tests.conftest import (
     COMPOSE_YAML,
     HEALTHCHECK_TOML,
@@ -34,6 +34,7 @@ from environment_servers.harbor.verifier import _verifier_image
 from nemo_gym.sandbox.providers.base import SandboxExecResult, SandboxSpec
 from nemo_gym.tasks.harbor import load_task
 from nemo_gym.tasks.harbor.dockerfile import OverlayRun
+from nemo_gym.tasks.harbor.errors import HarborTaskError
 
 
 class TestOverlay:
@@ -520,14 +521,23 @@ class TestOverlay:
         assert len(sandbox.execs) == 1 and sandbox.stopped
 
     def test_sandbox_ttls_stay_episode_sized_when_there_is_an_overlay(self, tmp_path, monkeypatch):
-        server, task, _, _ = self.overlay_server(tmp_path, monkeypatch, toml=SEPARATE_IN_TASK_IMAGE_TOML)
+        server, task, _, _ = self.overlay_server(tmp_path, monkeypatch)
         config, slack = task.config, server.config.sandbox_ttl_slack_s
         assert config.environment.build_timeout_sec == 600 and task.overlay
-        agent_spec = server._sandbox_spec(task, "/app")
         episode = server.config.default_episode_timeout_seconds + server.config.cleanup_timeout_seconds
         # The agent sandbox lives for the environment's whole episode, which already covers the overlay.
-        assert agent_spec.ttl_s == episode + slack
+        assert server._sandbox_spec(task, "/app").ttl_s == episode + slack
 
+        # A separate verifier in the task's own image: Harbor's effective verifier environment is a copy of
+        # [environment] carrying its docker_image, a prebuilt image that resolves no overlay (the loader admits the
+        # task-image shape with a declared image only), so no build budget is added and the verifier starts from the
+        # task image with the agent's environment.
+        toml = SEPARATE_IN_TASK_IMAGE_TOML.replace(
+            "[environment]\n", '[environment]\ndocker_image = "debian:bookworm-slim"\n'
+        )
+        server, task, _, _ = self.overlay_server(tmp_path, monkeypatch, toml=toml)
+        assert not task.overlay and task.verifier_image is None
+        assert server._sandbox_spec(task, "/app").ttl_s == episode + slack
         specs = []
 
         class RecordingSandbox:
@@ -540,22 +550,12 @@ class TestOverlay:
         monkeypatch.setattr("environment_servers.harbor.sandboxes.AsyncSandbox", RecordingSandbox)
         asyncio.run(server._create_verifier_sandbox(task))
         (verifier_spec,) = specs
-        # The verifier gets the same episode-sized lifetime, overlay included: `timeout_sec + slack (+ build)`
-        # would not clear a provider's renew interval (TB4's 1800 s), which masks every separate-mode episode.
+        # The verifier gets the same episode-sized lifetime: `timeout_sec + slack` would not clear a provider's
+        # renew interval (TB4's 1800 s), which masks every separate-mode episode (M10 smVVP).
+        agent_spec = server._sandbox_spec(task, "/app")
         assert verifier_spec.ttl_s == agent_spec.ttl_s == episode + slack >= 1800 + config.verifier.timeout_sec
-        # The verifier runs in the task's own image: it gets the same resolved Dockerfile environment as the agent.
         assert verifier_spec.image == task.image == "debian:bookworm-slim"
-        assert verifier_spec.env == agent_spec.env == {"PATH": f"/opt/tools/bin:{IMAGE_PATH}", "MSG": "hi there"}
-
-        # A pull-mode task has no overlay and the same lifetimes.
-        server, task, _, _ = self.overlay_server(
-            tmp_path, monkeypatch, dockerfile="FROM img\nWORKDIR /app\n", toml=SEPARATE_IN_TASK_IMAGE_TOML
-        )
-        assert not task.overlay
-        assert server._sandbox_spec(task, "/app").ttl_s == episode + slack
-        specs.clear()
-        asyncio.run(server._create_verifier_sandbox(task))
-        assert specs[0].ttl_s == episode + slack
+        assert verifier_spec.env == agent_spec.env
 
     def separate_verifier(self, tmp_path, monkeypatch, *, toml=SEPARATE_IN_TASK_IMAGE_TOML, verifier=None):
         server, task, agent, _ = self.overlay_server(tmp_path, monkeypatch, toml=toml)
@@ -571,55 +571,22 @@ class TestOverlay:
         monkeypatch.setattr(server, "_create_verifier_sandbox", create_verifier)
         return server, task, agent, verifier
 
-    async def test_separate_verifier_in_the_task_image_gets_the_overlay(self, tmp_path, monkeypatch):
-        server, task, agent, verifier = self.separate_verifier(tmp_path, monkeypatch)
-        assert not task.config.is_shared_verifier and _verifier_image(task) == "debian:bookworm-slim"
-
-        result = (await run_episode(server, task)).result
-
-        assert result.reward == 1.0 and result.verifier_mode == "separate", result
-        assert result.mask_sample is False and result.failure_kind is None
-        verifier_commands = [c["command"] for c in verifier.execs]
-        # The same three lines, in the same state, before anything else touches the verifier's sandbox.
-        assert verifier.execs[0]["seen"]["command"] == "apt-get update && apt-get install -y curl"
-        assert verifier.run("apt-get update")["seen"]["env"] == {"PATH": IMAGE_PATH}
-        assert verifier.run("as agent")["seen"] == {
-            "command": 'echo "as agent" > /tmp/who',
-            "env": {"PATH": f"/opt/tools/bin:{IMAGE_PATH}", "MSG": "hi there"},
-            "user": "agent",
-            "cwd": "/app",
-        }
-        assert verifier_commands.index(verifier.run("as agent")["command"]) < next(
-            i for i, c in enumerate(verifier_commands) if "test.sh" in c
-        )
-        assert agent.stopped and verifier.stopped
-
-    async def test_separate_verifier_overlay_failure_masks_the_sample(self, tmp_path, monkeypatch):
-        verifier = OverlaySandbox(failing="apt-get install")
-        server, task, agent, verifier = self.separate_verifier(tmp_path, monkeypatch, verifier=verifier)
-
+    async def test_a_separate_verifier_with_no_image_and_no_tests_dockerfile_is_refused_as_harbor_refuses_it(
+        self, tmp_path, monkeypatch
+    ):
+        """Harbor's verifier environment dir is always tests/: this shape fails its environment validation, so the
+        loader refuses it (prepare leaves it out) and the server refuses it at seed. Nothing grades in the agent
+        image, overlay or not."""
+        agent = OverlaySandbox()
+        server, task, _, _ = make_server(tmp_path, monkeypatch, agent, dockerfile=OVERLAY_DOCKERFILE)
+        (task.path / "task.toml").write_text(SEPARATE_IN_TASK_IMAGE_TOML)
+        with pytest.raises(HarborTaskError, match="has no environment definition"):
+            load_task(task.path)
         response = await run_episode(server, task)
-
-        # The rollout is complete; a verifier sandbox that cannot take the overlay must not discard it.
-        assert response.failure is None, response.failure
-        result = response.result
-        assert result.reward == 0.0 and result.mask_sample is True
-        assert result.failure_kind == OVERLAY_FAILED_KIND == "harbor:overlay_failed"
-        assert "Dockerfile overlay failed in the verifier sandbox" in result.failure_reason
-        assert "RUN line 1/3 'apt-get update && apt-get install -y curl' exited 100" in result.failure_reason
-        assert "E: no package" in result.failure_reason
-        assert not any("test.sh" in c["command"] for c in verifier.execs)
-        assert agent.stopped and verifier.stopped
-
-    async def test_separate_verifier_provider_failure_during_the_overlay_masks_the_sample(self, tmp_path, monkeypatch):
-        verifier = OverlaySandbox(
-            failing="apt-get install",
-            failure=SandboxExecResult(stdout=None, stderr="gone", return_code=-1, error_type="sandbox"),
-        )
-        server, task, _, verifier = self.separate_verifier(tmp_path, monkeypatch, verifier=verifier)
-        result = (await run_episode(server, task)).result
-        assert result.mask_sample is True and result.failure_kind == "provider_unavailable"
-        assert "could not run in the sandbox: sandbox" in result.failure_reason and verifier.stopped
+        assert response.failure.stage == "seed" and response.failure.terminal
+        assert "has no environment definition" in response.failure.failure_reason
+        assert "Set [verifier.environment].docker_image or add tests/Dockerfile" in response.failure.failure_reason
+        assert agent.execs == [] and not server._sandboxes
 
     async def test_prebuilt_verifier_image_gets_no_overlay(self, tmp_path, monkeypatch):
         toml = TASK_TOML.replace(
