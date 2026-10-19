@@ -381,6 +381,18 @@ class SandboxPty:
         )
 
 
+def _rollout_attributes() -> dict[str, str]:
+    """The rollout id Gym's endpoint spans carry, so sandbox spans are filterable per rollout too.
+
+    Imported here, not at module level: `global_config` imports the sandbox registry while it is
+    still initialising, and `rollout_correlation` imports constants from `global_config`.
+    """
+    from nemo_gym.rollout_correlation import current_rollout_id
+
+    rollout_id = current_rollout_id()
+    return {"nemo.gym.rollout.id": rollout_id} if rollout_id else {}
+
+
 def _sandbox_id(handle: Any) -> str | None:
     """The provider-neutral id of a handle, or None for a handle-less test double."""
     return getattr(handle, "sandbox_id", None)
@@ -442,7 +454,7 @@ class AsyncSandbox:
             with managed_span(
                 GymSpanGroup.SANDBOX,
                 "gym.sandbox.start",
-                **{"nemo.gym.sandbox.provider": provider_name},
+                **{"nemo.gym.sandbox.provider": provider_name, **_rollout_attributes()},
             ) as span:
                 handle = await self._provider.create(requested_spec)
                 if span is not None:
@@ -524,7 +536,7 @@ class AsyncSandbox:
         with managed_span(
             GymSpanGroup.SANDBOX,
             "gym.sandbox.exec",
-            **{"nemo.gym.sandbox.provider": provider_name},
+            **{"nemo.gym.sandbox.provider": provider_name, **_rollout_attributes()},
         ) as span:
             result = await self._exec_uninstrumented(
                 command,
@@ -654,6 +666,7 @@ class AsyncSandbox:
                     **{
                         "nemo.gym.sandbox.provider": self._telemetry_provider_name(),
                         "nemo.gym.sandbox.id": _sandbox_id(self._handle),
+                        **_rollout_attributes(),
                     },
                 ):
                     await self._provider.close(self._handle)
