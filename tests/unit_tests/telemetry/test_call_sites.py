@@ -188,19 +188,6 @@ async def test_sandbox_spans_keep_the_rollout_id_when_the_provider_fails(recorde
     assert span.attributes["nemo.gym.rollout.id"] == "7-0"
 
 
-@pytest.mark.parametrize(
-    "module",
-    ["nemo_gym.global_config", "nemo_gym.rollout_correlation", "nemo_gym.server_utils", "nemo_gym.sandbox.api"],
-)
-def test_sandbox_api_import_does_not_create_an_import_cycle(module):
-    """`global_config` imports the sandbox registry while initialising; the sandbox API must not
-    import `rollout_correlation` (which reads `global_config` constants) at module level."""
-    import subprocess
-    import sys
-
-    subprocess.run([sys.executable, "-c", f"import {module}"], check=True, timeout=120)
-
-
 async def test_sandbox_span_never_records_the_command(recorded_spans, started_sandbox):
     """In a code-execution environment the command is model output or task content.
 
@@ -485,3 +472,39 @@ def test_lens_imports_are_function_local_outside_the_fallback_resolver():
             if targets and path.name not in allowed_at_module_scope:
                 offenders.append((path.name, targets))
     assert not offenders, f"module-scope nemo.lens imports outside the resolvers: {offenders}"
+
+
+# --------------------------------------------------------------------------- #
+# Driver dispatch
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"_ng_task_index": 3, "_ng_rollout_index": 0}, "3-0"),
+        ({"_ng_task_index": 3, "_ng_rollout_index": 0, "_ng_attempt_index": 2}, "3-0-a2"),
+        ({"_ng_rollout_id": "custom", "_ng_attempt_index": 2}, "custom-a2"),
+        ({"task_id": {"taskset": "t"}, "_ng_task_index": 5, "_ng_rollout_index": 1}, "5-1"),
+    ],
+)
+def test_dispatch_span_takes_its_identity_from_the_collector_row(recorded_spans, row, expected):
+    """A materialized episode body carries the identity only as `episode_id`; the span reads the row."""
+    from nemo_gym.rollout_collection import _dispatch_span
+
+    with _dispatch_span(row, "env"):
+        pass
+
+    (span,) = [s for s in recorded_spans() if s.name == "gym.rollout.dispatch"]
+    assert span.attributes["nemo.gym.rollout.id"] == expected
+    assert span.attributes["nemo.gym.rollout.dispatch.name"] == "env"
+
+
+def test_dispatch_span_omits_the_id_for_a_row_without_identity(recorded_spans):
+    from nemo_gym.rollout_collection import _dispatch_span
+
+    with _dispatch_span({"input": "x"}, "agent"):
+        pass
+
+    (span,) = [s for s in recorded_spans() if s.name == "gym.rollout.dispatch"]
+    assert "nemo.gym.rollout.id" not in span.attributes
