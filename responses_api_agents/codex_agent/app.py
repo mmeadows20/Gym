@@ -66,7 +66,11 @@ from nemo_gym.sandbox.access import DirectSandboxConnection
 from nemo_gym.sandbox.config import resolve_provider_config
 from nemo_gym.server_utils import get_global_config_dict, get_response_json, raise_for_status
 from nemo_gym.skills import stage_skills
-from responses_api_agents.codex_agent.observability import read_codex_observations
+from responses_api_agents.codex_agent.observability import (
+    parse_codex_observations,
+    parse_codex_usage,
+    read_codex_observations,
+)
 from responses_api_agents.codex_agent.sandbox import CodexSandboxSession
 from responses_api_agents.codex_agent.setup_codex import ensure_codex
 from responses_api_agents.codex_agent.transport import rate_limit_proxy
@@ -78,6 +82,44 @@ _COMPACTION_ADVISORY = (
     "Heads up: Long threads and multiple compactions can cause the model to be less accurate. "
     "Start a new thread when possible to keep threads small and targeted."
 )
+
+
+def _terminal_model_error(
+    events: list[tuple[float, dict]],
+    statuses: list[int] | None,
+    cleanup: dict | None,
+    failure: BaseException | None,
+    errors: list[str],
+) -> str | None:
+    """Recognize a reported provider failure. Tested on Codex 0.144.4.
+
+    Codex reports an unrecovered HTTP error with turn.failed and exit code 1.
+    Require the captured terminal HTTP error and clean supervision; a separate
+    worker, cleanup or CLI error must not be mistaken for that provider outcome.
+    """
+    if not statuses or not 400 <= statuses[-1] <= 599:
+        return None
+    if (
+        failure is not None
+        or cleanup is None
+        or cleanup["return_code"] != 1
+        or cleanup["error"]
+        or cleanup["timed_out"]
+    ):
+        return None
+    terminal = next(
+        (event for _, event in reversed(events) if event.get("type") in ("turn.completed", "turn.failed")),
+        {},
+    )
+    message = (terminal.get("error") or {}).get("message")
+    if (
+        terminal.get("type") != "turn.failed"
+        or not isinstance(message, str)
+        or not message.strip()
+        or any(error != message for error in errors)
+    ):
+        return None
+    return message
 
 
 def _sandbox_prepare_command(workdir: str, directory: str, runtime: str) -> str:
@@ -575,7 +617,8 @@ class CodexAgent(SimpleResponsesAPIAgent):
                     f"Codex installer exited {installed.return_code}, command={install_command}, "
                     f"error_type={installed.error_type}; stdout={installed.stdout}; stderr={installed.stderr}"
                 )
-            await sandbox.upload(Path(__file__).with_name("sandbox_runner.py"), f"{directory}/sandbox_runner.py")
+            for filename in ("sandbox_runner.py", "sandbox_transport.py"):
+                await sandbox.upload(Path(__file__).with_name(filename), f"{directory}/{filename}")
         except BaseException as error:
             try:
                 await state.close(self.config.session_close_timeout_seconds)
@@ -672,12 +715,14 @@ class CodexAgent(SimpleResponsesAPIAgent):
         prompt: str,
         system: str,
     ) -> NeMoGymResponse:
-        config = self._build_config(
-            self._resolve_call_base_url(state.request.episode_id.capture_key), developer_instructions=system
-        )
+        invocation_id = state.request.episode_id.capture_key
+        base_url = self._resolve_call_base_url(invocation_id)
+        config = self._build_config(base_url, developer_instructions=system)
+        config["model_providers"]["gym"]["http_headers"] = {"x-session-id": invocation_id}
         await state.upload_text("home/.codex/config.toml", toml_dumps(config))
         timeout = resolve_agent_timeout(body.metadata, ceiling=self.config.timeout)
         command = self._build_command("-", state.session.workdir)
+        command.remove("--ephemeral")
         command[0:1] = [
             f"{state.runtime}/node/bin/node",
             f"{state.runtime}/codex/node_modules/@openai/codex/bin/codex.js",
@@ -685,6 +730,9 @@ class CodexAgent(SimpleResponsesAPIAgent):
         payload = {
             "directory": state.session.session_dir,
             "command": command,
+            "model_base_url": base_url,
+            "invocation_id": invocation_id,
+            "timeout": timeout,
             "prompt": prompt,
             "cwd": state.session.workdir,
             "env": {
@@ -779,7 +827,9 @@ class CodexAgent(SimpleResponsesAPIAgent):
             and failure is None
             and (output_limited or (cleanup["timed_out"] and not errors))
         )
-        if not ((successful_exit and not errors) or gradable_limit):
+        terminal_error = _terminal_model_error(events, state.model_attempt_statuses, cleanup, failure, errors)
+        reported_model_error = terminal_error is not None
+        if not ((successful_exit and not errors) or gradable_limit or reported_model_error):
             errors = [*startup_warnings, *compaction_warnings, *errors]
             startup_warnings = []
             compaction_warnings = []
@@ -791,6 +841,20 @@ class CodexAgent(SimpleResponsesAPIAgent):
         if cleanup and not completed and not cleanup["timed_out"] and not output_limited:
             error = error or "Codex ended without turn.completed"
         status = "failed" if error else "incomplete" if cleanup["timed_out"] or output_limited else "completed"
+        response_usage = NeMoGymResponseUsage(
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            total_tokens=usage["input_tokens"] + usage["output_tokens"],
+            input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=usage["cached_input_tokens"]),
+            output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=usage["reasoning_tokens"]),
+        )
+        if reported_model_error and not completed:
+            native_usage = parse_codex_usage(state.native_transcript)
+            if native_usage is not None:
+                response_usage = native_usage
+            elif output or 200 in state.model_attempt_statuses:
+                # Prior work without a usage artifact is unknown, not a zero-token run.
+                response_usage = None
         conversation = [NeMoGymEasyInputMessage(role="user", content=prompt)]
         if system:
             conversation.insert(0, NeMoGymEasyInputMessage(role="system", content=system))
@@ -801,11 +865,17 @@ class CodexAgent(SimpleResponsesAPIAgent):
             *(ObservationGap(code="model_metadata_fallback", detail=warning) for warning in startup_warnings),
             *(ObservationGap(code="compaction_accuracy_advisory", detail=warning) for warning in compaction_warnings),
         ]
-        for field, code in (
-            ("cached_input_tokens", "cached_token_usage_unavailable"),
-            ("reasoning_tokens", "reasoning_token_usage_unavailable"),
+        for count, code in (
+            (
+                response_usage.input_tokens_details.cached_tokens if response_usage else None,
+                "cached_token_usage_unavailable",
+            ),
+            (
+                response_usage.output_tokens_details.reasoning_tokens if response_usage else None,
+                "reasoning_token_usage_unavailable",
+            ),
         ):
-            if usage[field] is None:
+            if count is None:
                 gaps.append(ObservationGap(code=code, detail="CLI detail counters are absent or defaulted to zero"))
         stream_errors = [event for _, event in events if event.get("type") == "error"]
         if not completed or stream_errors:
@@ -877,15 +947,28 @@ class CodexAgent(SimpleResponsesAPIAgent):
                 AgentInvocation(
                     invocation_id=state.request.episode_id.capture_key,
                     status="incomplete" if failure else status,
+                    error_type="provider_error" if reported_model_error else None,
                     conversation=[*conversation, *output],
                 ),
                 *tools,
             ],
             gaps=gaps,
         )
+        if state.native_transcript is not None:
+            native = parse_codex_observations(
+                state.native_transcript,
+                invocation_id,
+                returncode=cleanup["return_code"] if cleanup else None,
+                timed_out=bool(cleanup and cleanup["timed_out"]),
+            )
+            native.records[0].status = "incomplete" if failure else status
+            if reported_model_error:
+                native.records[0].error_type = "provider_error"
+            native.gaps.extend(gap for gap in gaps if gap.code != "model_call_join_key_unavailable")
+            state.observations = native
         if failure is not None:
             raise failure
-        if error:
+        if error and not reported_model_error:
             raise HTTPException(502, f"Codex execution failed: {error}")
         return NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
@@ -895,17 +978,11 @@ class CodexAgent(SimpleResponsesAPIAgent):
             output=output,
             status=status,
             incomplete_details={"reason": "max_output_tokens"} if output_limited else None,
-            error=None,
+            error={"code": "server_error", "message": terminal_error} if reported_model_error else None,
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
-            usage=NeMoGymResponseUsage(
-                input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"],
-                total_tokens=usage["input_tokens"] + usage["output_tokens"],
-                input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=usage["cached_input_tokens"]),
-                output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=usage["reasoning_tokens"]),
-            ),
+            usage=response_usage,
             metadata={
                 "harness_execution": "sandbox",
                 **({"harness_hostname": runtime.hostname, "harness_pid": str(runtime.pid)} if runtime else {}),
