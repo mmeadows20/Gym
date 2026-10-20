@@ -89,7 +89,7 @@ _TRUNCATION_ERROR = "First response truncated due to output length limit"
 
 
 def _model_rejection_status(error: object) -> int | None:
-    """The HTTP status in a Hermes API error text when it is a model rejection, else ``None``."""
+    """Recognize legacy rejection metadata; tested on Hermes revision 26bb847a8849."""
     match = _HTTP_STATUS.search(str(error or ""))
     if match is None:
         return None
@@ -665,6 +665,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
             result=result,
             model_name=self._model_name(),
             n_input=len(params["history"]) + 1,
+            # Report the failed model exchange to the EnvironmentServer; it owns grading policy.
+            retain_provider_failure=True,
         )
         # Verifiers see Gym's MCP naming; the model's own names stay in the captured model calls.
         server_names = [access.name for access in mcp_accesses]

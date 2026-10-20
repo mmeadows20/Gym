@@ -270,7 +270,8 @@ async def test_activation_replay_survives_disconnected_waiter(agent, state):
         )
 
 
-def test_provider_failure_is_http_500_and_replays_without_rerunning(agent, state):
+@pytest.mark.parametrize("status", [400, 401, 429, 500])
+def test_provider_failure_is_reported_and_replays_without_rerunning(agent, state, status):
     agent._initialize_agent_session_state = AsyncMock(return_value=state)
     state.upload_json = AsyncMock()
     mock_json_download(
@@ -278,7 +279,7 @@ def test_provider_failure_is_http_500_and_replays_without_rerunning(agent, state
         side_effect=[
             {"cleanup_confirmed": True, "error": None},
             {
-                "result": {"failed": True, "error": "HTTP 429 Too Many Requests", "messages": []},
+                "result": {"failed": True, "error": f"HTTP {status} controlled model failure", "messages": []},
                 "runtime": {"hostname": "sandbox", "pid": 123},
             },
         ],
@@ -288,7 +289,9 @@ def test_provider_failure_is_http_500_and_replays_without_rerunning(agent, state
         path = f"/ng-rollout/{state.request.episode_id.capture_key}/v1/responses"
         for _ in range(2):
             response = client.post(path, json={"input": "task"})
-            assert response.status_code == 500
+            assert response.status_code == 200
+            assert response.json()["status"] == "failed"
+            assert response.json()["error"]["message"] == f"HTTP {status} controlled model failure"
         state.upload_json.assert_awaited_once()
         assert state.session.cleanup is not None and state.session.cleanup["cleanup_confirmed"] is True
         close = client.post(
