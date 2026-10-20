@@ -670,6 +670,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                     raise RuntimeError(
                         f"Cannot create OpenCode sandbox workdir {workdir}: {workspace.stderr or workspace.stdout}"
                     )
+            state.sandbox_id = sandbox.sandbox_id
             command = _sandbox_prepare_command(workdir, directory, runtime)
             result = await sandbox.exec(command, timeout_s=self.config.sandbox_install_timeout_seconds)
             self._check_sandbox_setup(command, result)
@@ -948,6 +949,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             except Exception as exc:
                 error = error or f"OpenCode output parse failed: {exc}"
         result = state.session.cleanup
+        # Report a retained native model error as the agent's outcome. The environment
+        # decides whether partial work can be verified and whether its grade is usable.
+        model_error = self._terminal_model_error(export, result) if error is None and failure is None else None
         runtime = state.runtime_info
         if runtime is None:
             state.observations.gaps.append(ObservationGap(code="runtime_info_unavailable"))
@@ -981,6 +985,8 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 record.error_type = (
                     "cancelled"
                     if isinstance(failure, asyncio.CancelledError)
+                    else "provider_error"
+                    if model_error
                     else "server_error"
                     if error or failure
                     else "timeout"
@@ -996,13 +1002,10 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                         if state.session.owns_sandbox
                         else state.request.sandbox_access.connection.provider_config_ref
                     ),
-                    sandbox_id=(
-                        None
-                        if state.session.owns_sandbox
-                        else str(state.request.sandbox_access.connection.descriptor.get("sandbox_id", "unknown"))
-                    ),
+                    sandbox_id=state.sandbox_id,
                     outcome="timeout" if result["timed_out"] else "failed" if error or failure else "completed",
                     exit_code=result["return_code"],
+                    error_type="process_exit" if model_error else None,
                 )
             )
         state.observations.gaps.append(
@@ -1013,7 +1016,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         )
         if failure is not None:
             raise failure
-        if error:
+        if error and model_error is None:
             raise HTTPException(502, format_sandbox_error(error, stderr=state.stderr))
         return NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
@@ -1023,6 +1026,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             output=output,
             usage=usage,
             status=status,
+            error={"code": "server_error", "message": json.dumps(model_error)} if model_error else None,
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
@@ -1033,6 +1037,35 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 AGENT_TIMEOUT_METADATA_KEY: str(timeout),
             },
         )
+
+    @staticmethod
+    def _terminal_model_error(export: dict[str, Any], cleanup: dict | None) -> dict[str, Any] | None:
+        """Read a terminal provider error. Tested on OpenCode 1.17.11.
+
+        A completed assistant APIError with exit code 1 is a reported model failure,
+        including exhausted retryable errors. Cleanup errors, timeouts and other process
+        exits remain distinct; this classification does not decide grading or masking.
+        """
+        if cleanup is None or cleanup["timed_out"] or cleanup["error"] or cleanup["return_code"] != 1:
+            return None
+        assistants = [
+            message["info"] for message in export.get("messages", []) if message["info"].get("role") == "assistant"
+        ]
+        if not assistants:
+            return None
+        info = assistants[-1]
+        error = info.get("error")
+        if not isinstance(error, dict) or error.get("name") != "APIError":
+            return None
+        data = error.get("data")
+        if not isinstance(data, dict):
+            return None
+        status = data.get("statusCode")
+        if type(status) is not int or not 400 <= status <= 599:
+            return None
+        if info.get("finish") is not None or not info.get("time", {}).get("completed"):
+            return None
+        return error
 
 
 if __name__ == "__main__":
