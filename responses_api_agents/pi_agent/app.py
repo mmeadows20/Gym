@@ -80,6 +80,22 @@ MCP_SETUP_ERROR_EXIT_CODE = 78  # Must match gym_mcp.mjs (EX_CONFIG).
 _INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
 
 
+def _reported_model_error(events: list[tuple[float, dict[str, Any]]], cleanup: Mapping[str, Any]) -> bool:
+    """Recognize a completed error report. Tested on Pi 0.80.2.
+
+    Pi emits an assistant message with stopReason=error followed by agent_end
+    for unrecovered provider errors, including connection failures. Use these
+    events rather than parsing APIError.message, whose HTTP status is not retained.
+    A worker failure or interrupted cleanup is a separate execution failure.
+    """
+    if cleanup["return_code"] != 0 or cleanup["timed_out"] or cleanup["error"]:
+        return False
+    terminal = next((event for _, event in reversed(events) if event.get("type") == "agent_end"), {})
+    messages = terminal.get("messages") or []
+    assistant = next((message for message in reversed(messages) if message.get("role") == "assistant"), {})
+    return assistant.get("stopReason") == "error"
+
+
 def _sandbox_prepare_command(directory: str) -> str:
     # Keep the bootstrap POSIX sh: Bash must exist before its installer can run.
     bootstrap = """set -eu
@@ -755,6 +771,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                     self.config.model_server,
                     [*conversation, *output],
                     transcript_available=bool(output),
+                    capture_correlated=True,
                 )
             except Exception:
                 LOG.exception("failed to build interrupted Pi observations")
@@ -819,19 +836,20 @@ class PiAgent(SimpleResponsesAPIAgent):
             # Expected model limits/interruptions do not invalidate partial work.
             # They must not erase an independently confirmed worker or cleanup failure.
             terminal_error = None
-        error = cleanup["error"] or terminal_error
+        execution_error = cleanup["error"]
         if cleanup["return_code"] not in (None, 0) and not cleanup["timed_out"] and not model_limit:
-            error = error or f"Pi exited with code {cleanup['return_code']}"
+            execution_error = execution_error or f"Pi exited with code {cleanup['return_code']}"
         if not stop_reasons:
             cached_tokens = None
-            error = error or "Pi produced no assistant result"
+            execution_error = execution_error or "Pi produced no assistant result"
         elif stop_reasons[-1] not in ("stop", "length", "error", "aborted") and not cleanup["timed_out"]:
-            error = error or "Pi ended without a terminal assistant result"
+            execution_error = execution_error or "Pi ended without a terminal assistant result"
         incomplete = (
             cleanup["timed_out"] or model_limit or (stop_reasons and stop_reasons[-1] in ("length", "aborted"))
         )
         if cleanup["timed_out"] and not stop_reasons and cleanup["error"] is None:
-            error = None
+            execution_error = None
+        error = execution_error or terminal_error
         response = NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
             created_at=int(time()),
@@ -866,6 +884,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                 self.config.model_server,
                 [*conversation_input, *output],
                 transcript_available=bool(output),
+                capture_correlated=True,
             )
         except Exception:
             # Observation parsing must not turn a valid response/patch into a
@@ -890,9 +909,8 @@ class PiAgent(SimpleResponsesAPIAgent):
                     detail="Pi cache counters are absent, invalid, or defaulted to zero",
                 )
             )
-        if error:
-            # Keep the captured trajectory on session state for close, but do not invoke
-            # the benchmark verifier after a provider/runtime failure (same as Hermes).
+        if execution_error or (terminal_error and not _reported_model_error(events, cleanup)):
+            # Keep evidence for close; an execution failure must not be hidden by a model error report.
             raise RuntimeError(f"Pi agent failed: {error}")
         return response
 
